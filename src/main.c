@@ -7,6 +7,7 @@
 #include<stdio.h>
 #include<stdlib.h>
 #include<string.h>
+#include<time.h>
 
 static void print_prompt(void){
     printf("db > ");
@@ -27,6 +28,7 @@ int main(void){
                      continue;
             }
         } 
+
         Statement statement;
         switch(prepare_statement(input_buffer,&statement)){
             case(PREPARE_SUCCESS):
@@ -35,7 +37,12 @@ int main(void){
                 printf("Unrecognized keyword at start of '%s", input_buffer->buffer);
                 continue;
         }
+
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
         execute_statement(&statement);
-        printf("Executed.\n");
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        long long elapsed_ns = (end.tv_sec - start.tv_sec) * 1000000000LL + (end.tv_nsec - start.tv_nsec);
+        printf("Executed. (%.3f ms)\n", elapsed_ns / 1e6);
     }
 }
