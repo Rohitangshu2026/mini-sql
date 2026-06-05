@@ -12,8 +12,11 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 
 # Library target — every module except main lives here so tests/ and bench/
 # can link against it later without recompiling.
-add_library(mini_sql_lib STATIC
+add_library(mini_sql_lib
     src/input_buffer.c
+    src/meta_command.c
+    src/statement.c
+    src/executor.c
 )
 target_include_directories(mini_sql_lib PUBLIC include)
 
