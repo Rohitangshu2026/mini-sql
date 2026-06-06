@@ -17,6 +17,9 @@ add_library(mini_sql_lib
     src/meta_command.c
     src/statement.c
     src/executor.c
+    src/schema.c
+    src/record.c
+    src/table.c
 )
 target_include_directories(mini_sql_lib PUBLIC include)
 
