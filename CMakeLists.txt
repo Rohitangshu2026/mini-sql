@@ -20,6 +20,8 @@ add_library(mini_sql_lib
     src/schema.c
     src/record.c
     src/table.c
+    src/pager.c
+    src/cursor.c
 )
 target_include_directories(mini_sql_lib PUBLIC include)
 
@@ -36,6 +38,7 @@ set(MINI_SQL_TESTS
     max_length_strings
     string_too_long
     negative_id
+    persistence
 )
 foreach(t ${MINI_SQL_TESTS})
     add_test(

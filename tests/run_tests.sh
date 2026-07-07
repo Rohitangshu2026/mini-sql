@@ -10,6 +10,7 @@
 set -u
 
 DB="${MINI_SQL_BIN:-./build/mini_sql}"
+TESTDB="${TMPDIR:-/tmp}/mini_sql_test.db"
 
 # Strip our timing suffix " (12.345 ms)" and trailing whitespace so the
 # output is deterministic and prompt spacing doesn't matter.
@@ -17,9 +18,11 @@ normalize() {
     sed -E -e 's/ \([0-9]+\.[0-9]+ ms\)//' -e 's/[[:space:]]+$//'
 }
 
-# run INPUT -> normalized output on stdout
+# run INPUT -> normalized output on stdout.
+# The binary now needs a database file; start each case from an empty one.
 run() {
-    printf '%s' "$1" | "$DB" | normalize
+    rm -f "$TESTDB"
+    printf '%s' "$1" | "$DB" "$TESTDB" | normalize
 }
 
 # want OUTPUT NEEDLE -> 0 if NEEDLE appears as a literal substring
@@ -68,7 +71,16 @@ t_negative_id() {
     want "$out" "ID must be positive."
 }
 
-ALL=(inserts_and_retrieves table_full max_length_strings string_too_long negative_id)
+t_persistence() {
+    # Insert then exit (flushes to disk), reopen the SAME file, and read it back.
+    rm -f "$TESTDB"
+    printf 'insert 1 user1 person1@example.com\n.exit\n' | "$DB" "$TESTDB" >/dev/null
+    local out
+    out=$(printf 'select\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    want "$out" "(1, user1, person1@example.com)"
+}
+
+ALL=(inserts_and_retrieves table_full max_length_strings string_too_long negative_id persistence)
 
 run_one() {
     if "t_$1"; then

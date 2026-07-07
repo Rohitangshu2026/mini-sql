@@ -15,16 +15,21 @@ static void print_prompt(void){
     printf("db > ");
 }
 
-int main(void){
-    ColumnDefinition users_columns[] = { 
-        {.name = "id", .type = COLUMN_INT, .size = 4}, 
-        {.name = "username",.type = COLUMN_TEXT, .size = 32}, 
+int main(int argc, char* argv[]){
+    if(argc < 2){
+        printf("Must supply a database filename.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    ColumnDefinition users_columns[] = {
+        {.name = "id", .type = COLUMN_INT, .size = 4},
+        {.name = "username",.type = COLUMN_TEXT, .size = 32},
         {.name = "email",.type = COLUMN_TEXT, .size = 255},
     };
 
     uint32_t num_columns = sizeof(users_columns) / sizeof(users_columns[0]);
     Schema* schema = schema_create(users_columns, num_columns);
-    Table* table = table_new(schema);
+    Table* table = db_open(argv[1], schema);
     statement_set_default_schema(schema);
 
     InputBuffer* input_buffer = new_input_buffer();

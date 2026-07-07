@@ -1,21 +1,18 @@
 #ifndef TABLE_H
 #define TABLE_H
 
-#include "schema.h"
-
 #include<stdint.h>
 
-#define TABLE_MAX_PAGES 100
-extern const uint32_t PAGE_SIZE;
+#include "pager.h"
+#include "schema.h"
 
 typedef struct{
-    Schema* schema;
+    Schema* schema;    /* borrowed until db_close tears the connection down */
     uint32_t num_rows;
-    void* pages[TABLE_MAX_PAGES];
+    Pager* pager;     /* owns the page cache + backing file */
 }Table;
 
-Table* table_new(Schema* schema);
-void table_free(Table* table);
-void* table_row_slot(Table* table, uint32_t row_num);
+Table* db_open(const char* filename, Schema* schema);
+void db_close(Table* table);
 
 #endif
