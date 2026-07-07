@@ -8,14 +8,14 @@ A SQLite-style database engine, built from scratch in C — one layer at a time.
 [cstack's *Let's Build a Simple Database*](https://cstack.github.io/db_tutorial/),
 but **deliberately diverges in one important way**: where the tutorial hardcodes
 a single `Row` struct and compile-time byte offsets, `mini-sql` is **schema-driven
-from the first commit**. The on-disk/in-memory layout of a row is *computed at
-runtime* from a `Schema`, not frozen by the C compiler. That single decision is
-what keeps the door open to `CREATE TABLE`, `ALTER TABLE`, and multiple tables
-without a rewrite.
+from the first commit**. The layout of a row is *computed at runtime* from a
+`Schema`, not frozen by the C compiler. That single decision is what keeps the
+door open to `CREATE TABLE`, `ALTER TABLE`, and multiple tables without a rewrite.
 
-Today it is an in-memory, single-table store with a validating insert parser and
-a black-box test suite. The storage layer underneath is the shape the future
-pager and B-tree will plug into.
+Today it is a **persistent, single-table store**: rows are serialized into 4 KiB
+pages, cached in memory by a pager, and flushed to a database file so they survive
+across runs. Reads and writes go through a cursor abstraction — the seam the
+B-tree will slot into next.
 
 ---
 
@@ -44,25 +44,28 @@ pager and B-tree will plug into.
 ## Quick start
 
 ```sh
-cmake -S . -B build          # configure
-cmake --build build          # compile
-./build/mini_sql             # run the REPL
-ctest --test-dir build       # run the test suite
+cmake -S . -B build           # configure
+cmake --build build           # compile
+./build/mini_sql mydb.db      # run the REPL against a database file
+ctest --test-dir build        # run the test suite
 ```
 
-A session:
+The binary takes the database filename as an argument. Insert some rows, exit,
+then reopen the **same file** — the data is still there:
 
 ```text
+$ ./build/mini_sql mydb.db
 db > insert 1 alice alice@example.com
 Executed. (0.004 ms)
 db > insert 2 bob bob@example.com
 Executed. (0.003 ms)
+db > .exit
+
+$ ./build/mini_sql mydb.db
 db > select
 (1, alice, alice@example.com)
 (2, bob, bob@example.com)
 Executed. (0.002 ms)
-db > insert -1 carol carol@example.com
-ID must be positive.
 db > .exit
 ```
 
@@ -81,19 +84,21 @@ tests. No third-party libraries.
 | `select` (full scan, prints all rows) | ✅ |
 | Input validation (syntax, negative id, over-length text, table full) | ✅ |
 | Schema-driven row (de)serialization | ✅ |
+| **Persistence to disk** (pager + backing file) | ✅ |
+| **Cursor abstraction** (start / end / value / advance) | ✅ |
 | Per-statement execution timing | ✅ |
 | Black-box test suite via CTest | ✅ |
-| Persistence to disk | ⛔ in-memory only |
-| B-tree / ordered access | ⛔ append-only array |
+| B-tree / ordered access | ⛔ append-only, flushed as an array of pages |
 | `CREATE TABLE` / multiple tables | ⛔ single hardcoded schema |
+| Crash safety (journal / WAL) | ⛔ flush happens only on clean `.exit` |
 
 ---
 
 ## Architecture at a glance
 
 The engine is a classic **front-end / back-end** split. The front end turns text
-into a validated `Statement`; the back end executes it against storage. Everything
-above the storage layer is stateless; all mutable state lives in a `Table`.
+into a validated `Statement`; the back end executes it against storage through a
+cursor. Durable state lives in a file, reached through the pager.
 
 ```mermaid
 flowchart TD
@@ -111,10 +116,14 @@ flowchart TD
 
     subgraph Backend["Back end — execute & store"]
         EXEC["executor — insert / select"]
-        TABLE["table — pages of rows"]
+        CUR["cursor — a position in the table"]
+        TABLE["table — db_open / db_close"]
         REC["record — row (de)serialization"]
         SCHEMA["schema — column layout"]
+        PAGER["pager — page cache + file"]
     end
+
+    FILE[("database file")]
 
     REPL --> IB
     REPL --> META
@@ -122,26 +131,30 @@ flowchart TD
     REPL --> EXEC
     STMT --> REC
     STMT --> SCHEMA
-    EXEC --> TABLE
+    EXEC --> CUR
     EXEC --> REC
+    CUR --> TABLE
+    TABLE --> PAGER
     TABLE --> SCHEMA
     REC --> SCHEMA
     META --> TABLE
+    PAGER --> FILE
 ```
 
 The guiding principle: **`schema` sits at the bottom of the dependency graph and
 everything reads its layout decisions.** `record` knows *how to move bytes*;
-`schema` knows *where the bytes go*. Keeping those two concerns apart is what makes
-the row format mutable later.
+`schema` knows *where the bytes go*; the `pager` knows *how bytes reach disk*. The
+`cursor` lets the executor address rows without knowing any of that — which is why
+swapping the storage engine for a B-tree won't touch the executor.
 
 ---
 
 ## How it maps to SQLite
 
-SQLite compiles SQL to bytecode and runs it on a virtual machine over a B-tree/pager
-stack. `mini-sql` builds the **bottom-right of that diagram** first (storage), and
-keeps the "compiler" intentionally trivial (no bytecode VM — the executor runs the
-statement directly).
+SQLite compiles SQL to bytecode and runs it on a virtual machine over a B-tree /
+pager stack. `mini-sql` is building that stack **bottom-up**: the pager is now a
+genuine match; the B-tree is the next block; the SQL-compiler half stays
+intentionally trivial (no bytecode VM — the executor runs the statement directly).
 
 ```mermaid
 flowchart LR
@@ -160,10 +173,10 @@ flowchart LR
         m1["statement.c — strtok tokenizer"]
         m2["statement.c — keyword dispatch"]
         m3["(none — no parse tree)"]
-        m4["executor.c — direct execution"]
-        m5["table.c — array of pages"]
-        m6["(none yet — in-memory)"]
-        m7["stdio + malloc"]
+        m4["executor.c + cursor.c"]
+        m5["(none yet — append-only pages)"]
+        m6["pager.c — file-backed page cache"]
+        m7["pager.c — open/read/write/lseek"]
     end
     s1 -.-> m1
     s2 -.-> m2
@@ -174,16 +187,17 @@ flowchart LR
     s7 -.-> m7
 ```
 
-The dotted lines that land on `(none)` are the honest gaps — they are also the
-[roadmap](#roadmap).
+The `pager` and `OS interface` rows are now real; the dotted lines that still land
+on `(none)` are the honest gaps — see the [roadmap](#roadmap).
 
 ---
 
 ## Module dependency graph
 
-Each `.c` includes only the headers it truly needs; `schema` and `input_buffer` are
-the leaves. The static library `mini_sql_lib` contains every module except `main`,
-so tests and future benchmarks link against it without recompiling sources.
+Each `.c` includes only the headers it truly needs; `pager`, `schema`, and
+`input_buffer` are the leaves. The static library `mini_sql_lib` contains every
+module except `main`, so tests and future benchmarks link against it without
+recompiling sources.
 
 ```mermaid
 flowchart BT
@@ -200,11 +214,14 @@ flowchart BT
     statement --> record
     executor --> statement
     executor --> table
-    record --> schema
+    executor --> cursor
+    cursor --> table
+    table --> pager
     table --> schema
+    record --> schema
 
     classDef leaf fill:#e8eefc,stroke:#5577cc;
-    class schema,input_buffer leaf;
+    class schema,input_buffer,pager leaf;
 ```
 
 | Module | Responsibility | Key entry points |
@@ -213,28 +230,32 @@ flowchart BT
 | `meta_command` | Handle `.`-prefixed commands; teardown on `.exit` | `do_meta_command` |
 | `schema` | Runtime column layout: types, sizes, **computed offsets** | `schema_create`, `schema_find_column_by_id/name`, `schema_free` |
 | `record` | An opaque row payload + schema-keyed get/set + (de)serialize | `record_init`, `record_set_int/text`, `serialize_record`, `print_record` |
-| `table` | Page-backed row storage; maps row number → byte slot | `table_new`, `table_row_slot`, `table_free` |
+| `pager` | Page cache backed by a file; reads on miss, flushes on close | `pager_open`, `pager_get_page`, `pager_flush`, `pager_close` |
+| `table` | Opens/closes a database connection over the pager | `db_open`, `db_close` |
+| `cursor` | A position within a table; abstracts row addressing | `table_start`, `table_end`, `cursor_value`, `cursor_advance` |
 | `statement` | Tokenize + validate input into a `Statement` | `prepare_statement`, `statement_set_default_schema` |
-| `executor` | Run a prepared `Statement` against a `Table` | `execute_statement` |
+| `executor` | Run a prepared `Statement` against a `Table` via a cursor | `execute_statement` |
 | `main` | REPL loop + wiring + lifetime management | — |
 
 ---
 
 ## The data model
 
-Five structs carry all state. Note the relationship semantics — they encode the
-ownership rules the code actually follows:
+The core structs and their ownership relationships (these encode the rules the
+code actually follows):
 
-- `Schema` **owns** its `ColumnDefinition` array (deep copy, including column names).
-- `Table` **borrows** a `Schema` (a non-owning pointer; `main` controls its lifetime).
-- `Statement` **holds** a `Record` inline.
-- `Record` is just bytes; it is **interpreted by** a `Schema` but does not own one.
+- `Schema` **owns** its `ColumnDefinition` array (deep copy, including names).
+- `Table` **holds** a `Pager` (owns it) and a `Schema` (borrowed at open, freed by
+  `db_close`).
+- `Pager` **owns** the page cache and the open file descriptor.
+- `Cursor` **points into** a `Table`; it owns nothing.
+- `Statement` **holds** a `Record` inline; `Record` is just bytes, **interpreted by**
+  a `Schema`.
 
 ```mermaid
 classDiagram
     class Schema {
         +uint32 version
-        +uint32 next_column_id
         +uint32 num_columns
         +ColumnDefinition columns
         +uint32 row_size
@@ -246,23 +267,30 @@ classDiagram
         +uint32 size
         +uint32 offset
     }
-    class Record {
-        +pointer payload
-        +uint32 payload_size
+    class Pager {
+        +int file_descriptor
+        +uint32 file_length
+        +pages100 pages
     }
     class Table {
         +Schema schema
         +uint32 num_rows
-        +pages100 pages
+        +Pager pager
     }
-    class Statement {
-        +StatementType type
-        +Record record_to_insert
+    class Cursor {
+        +Table table
+        +uint32 row_num
+        +bool end_of_table
+    }
+    class Record {
+        +pointer payload
+        +uint32 payload_size
     }
 
     Schema "1" *-- "many" ColumnDefinition : owns
+    Table "1" *-- "1" Pager : owns
     Table "1" o-- "1" Schema : borrows
-    Statement "1" *-- "1" Record : holds
+    Cursor "1" o-- "1" Table : points into
     Record ..> Schema : interpreted by
 ```
 
@@ -298,26 +326,25 @@ flowchart LR
     idf --- unf --- emf
 ```
 
-`table_row_slot` packs rows into 4 KiB pages, allocated lazily on first touch.
-**Rows never straddle a page boundary** — a simplifying invariant that makes a row's
-address a pure function of its row number.
+Rows are packed into 4 KiB pages. The **pager** owns those pages: it keeps a cache
+of up to 100 page pointers, allocates a page on first touch, reads it from the file
+on a cache miss, and writes every cached page back on `db_close`. **Rows never
+straddle a page boundary** — a row's address is a pure function of its row number.
 
 ```mermaid
 flowchart TD
-    T["Table (num_rows, schema*)"] --> PTR["pages[100] — pointers, NULL until used"]
-    PTR --> PG0
-    PTR --> PG1
-    PTR --> PGN["page 99"]
+    T["Table (num_rows, schema*)"] --> PG["Pager (fd, file_length)"]
+    PG --> CACHE["pages[100] — in-memory cache, NULL until touched"]
+    PG --> FILE[("database file")]
 
-    subgraph PG0["page 0 — 4096 bytes"]
+    subgraph CACHE0["cached page 0 — 4096 bytes"]
         r0["row 0 (291 B)"]
         r1["row 1 (291 B)"]
-        rd["… 14 rows total"]
+        rd["… 14 rows"]
         sl["22 B unused slack"]
     end
-    subgraph PG1["page 1 — 4096 bytes"]
-        rr["rows 14–27 …"]
-    end
+    CACHE --> CACHE0
+    FILE -. "read on cache miss / write on db_close" .- CACHE0
 ```
 
 The paging math:
@@ -332,6 +359,10 @@ Insert #1401 returns `EXECUTE_TABLE_FULL`. Because `rows_per_page` is derived fr
 `schema->row_size` at call time (not a compile-time constant), this all recomputes
 automatically the day the schema changes.
 
+> The row count is currently recovered as `file_length / row_size` on open. This is
+> a deliberately fragile stopgap (cstack's) that the B-tree replaces by storing its
+> own metadata — noted so it isn't mistaken for a design choice.
+
 ---
 
 ## Command lifecycle
@@ -339,68 +370,66 @@ automatically the day the schema changes.
 ### INSERT
 
 The parser validates **before** allocating, so a rejected insert never leaks the
-record payload. Only after every token passes does it build the `Record`.
+record payload. Execution opens a cursor at the end of the table and writes there.
 
 ```mermaid
 sequenceDiagram
     actor U as User
     participant M as main (REPL)
     participant S as statement
-    participant Sc as schema
-    participant R as record
     participant E as executor
-    participant T as table
+    participant C as cursor
+    participant P as pager
+    participant R as record
 
     U->>M: insert 1 alice a@x.com
     M->>S: prepare_statement(buf, &stmt)
-    activate S
-    S->>S: prepare_insert() — strtok per column
-    loop each column (validate only)
-        S->>Sc: column type + size
-        Sc-->>S: ColumnDefinition*
-    end
-    S->>R: record_init + record_set_int/text
+    S->>S: validate each column, then build the Record
     S-->>M: PREPARE_SUCCESS
-    deactivate S
 
     M->>E: execute_statement(&stmt, table)
-    activate E
-    E->>T: table_row_slot(table, num_rows)
-    T-->>E: void* slot
+    E->>C: table_end(table)
+    E->>C: cursor_value(cursor)
+    C->>P: pager_get_page(page_num)
+    P-->>C: void* page
+    C-->>E: void* slot
     E->>R: serialize_record(rec, slot)
     E-->>M: EXECUTE_SUCCESS
-    deactivate E
-
     M->>R: record_free(&stmt.record_to_insert)
     M-->>U: Executed. (0.003 ms)
 ```
 
 ### SELECT
 
-A full scan: each row is deserialized into a temporary `Record`, printed, and freed.
+A full scan: a cursor walks from the start of the table, deserializing and printing
+each row until `end_of_table`.
 
 ```mermaid
 sequenceDiagram
     actor U as User
     participant M as main
     participant E as executor
-    participant T as table
+    participant C as cursor
+    participant P as pager
     participant R as record
 
     U->>M: select
     M->>E: execute_statement(&stmt, table)
-    activate E
-    loop i in 0 .. num_rows-1
-        E->>T: table_row_slot(table, i)
-        T-->>E: void* slot
-        E->>R: deserialize_record(slot, &rec, schema)
-        E->>R: print_record(&rec, schema)
-        E->>R: record_free(&rec)
+    E->>C: table_start(table)
+    loop until cursor.end_of_table
+        E->>C: cursor_value(cursor)
+        C->>P: pager_get_page(page_num)
+        P-->>C: void* page
+        C-->>E: void* slot
+        E->>R: deserialize_record + print_record + record_free
+        E->>C: cursor_advance(cursor)
     end
     E-->>M: EXECUTE_SUCCESS
-    deactivate E
     M-->>U: (rows…) + Executed.
 ```
+
+On `.exit`, `db_close` flushes every cached page to the file — that's when the data
+becomes durable.
 
 ---
 
@@ -416,7 +445,7 @@ stateDiagram-v2
     Classify --> Prepare : otherwise
 
     Meta --> Prompt : success / unrecognized
-    Meta --> [*] : .exit (frees table + schema)
+    Meta --> [*] : .exit (flush pages, close file, free all)
 
     Prepare --> Execute : PREPARE_SUCCESS
     Prepare --> Prompt : syntax / negative-id / too-long / unrecognized
@@ -424,9 +453,10 @@ stateDiagram-v2
     Execute --> Prompt : EXECUTE_SUCCESS / EXECUTE_TABLE_FULL
 ```
 
-The loop is infinite by construction; the only exit is `.exit`, which frees the
-`Table` and `Schema` and calls `exit()` from inside `do_meta_command`. There is no
-fall-through cleanup path because control never reaches the end of `main`.
+The loop is infinite by construction; the only exit is `.exit`, which calls
+`db_close` (flush + close file + free pager, schema, and table) and then `exit()`
+from inside `do_meta_command`. There is no fall-through cleanup path because control
+never reaches the end of `main`.
 
 ---
 
@@ -475,13 +505,14 @@ Explicit ownership is the spine of a C codebase. The rules, drawn:
 
 ```mermaid
 flowchart TD
-    main ==>|owns| schema
-    main ==>|owns| table
+    main ==>|creates| schema
+    main ==>|creates| table
     main -.->|stack value| stmt["Statement"]
 
     schema ==>|owns: malloc + strdup| cols["columns[] + names"]
+    table ==>|owns| pager["Pager"]
+    pager ==>|owns| pagesfd["pages[] cache + open fd"]
     table -.->|borrows| schema
-    table ==>|owns: lazy malloc| pages["page buffers"]
     stmt ==>|owns: record_init| payload["Record.payload"]
 ```
 
@@ -491,13 +522,14 @@ Lifecycle rules:
 
 - `schema_create` deep-copies the caller's column array and `strdup`s each name, so
   the source array may be a stack literal in `main`.
-- `table_new` stores a **borrowed** `Schema*`; `table_free` frees the page buffers
-  but **not** the schema.
-- On `.exit`, `do_meta_command` frees the schema and the table (schema first, while
-  `table->schema` is still valid).
+- `db_open` opens the file (via `pager_open`) and stores a **borrowed** `Schema*`.
+- `db_close` is the single teardown path: it flushes every cached page, then
+  `pager_close` (closes the fd + frees the cache), then `schema_free`, then frees the
+  table. `.exit` is the only caller.
 - Each REPL iteration zero-initializes `Statement statement = {0}` and calls
   `record_free` after execution — a no-op for `select` (NULL payload), the real free
-  for `insert`. This plugs what would otherwise be a per-insert leak.
+  for `insert`. This plugs what would otherwise be a per-insert leak. The `Cursor`
+  is `malloc`'d per statement and freed at the end of each execute.
 
 ---
 
@@ -515,16 +547,19 @@ flowchart LR
         e[schema.c]
         f[record.c]
         g[table.c]
+        h[pager.c]
+        i[cursor.c]
     end
     main_c[main.c] --> exe["mini_sql (executable)"]
     lib --> exe
-    lib -.->|future| tests_bench["tests / bench targets"]
+    lib -.->|links| tests["CTest suite"]
 ```
 
 Compiled with `-Wall -Wextra -Wpedantic` under strict C11 (`CMAKE_C_EXTENSIONS
 OFF`), and emits `compile_commands.json` for clangd. The library/executable split
 exists so the test and benchmark targets can link the engine in one line without
-recompiling every source.
+recompiling every source. (`pager.c` defines `_POSIX_C_SOURCE` so the POSIX file
+calls resolve under strict C11.)
 
 ---
 
@@ -538,19 +573,20 @@ per case, so a failure names itself.
 sequenceDiagram
     participant CT as ctest
     participant SH as run_tests.sh
-    participant DB as ./mini_sql
+    participant DB as mini_sql
 
     CT->>SH: MINI_SQL_BIN=... run_tests.sh <case>
-    SH->>DB: printf "commands…" | mini_sql
+    SH->>DB: printf "commands…" | mini_sql <scratch.db>
     DB-->>SH: raw stdout
     SH->>SH: normalize (strip " (NN.NNN ms)" + trailing ws)
     SH->>SH: assert expected line present
     SH-->>CT: exit 0 (pass) / 1 (fail)
 ```
 
-The `normalize` step strips the timing suffix so assertions stay deterministic. The
-five cases mirror cstack Part 4: round-trip, table-full, max-length strings,
-over-length strings, and negative id.
+The `normalize` step strips the timing suffix so assertions stay deterministic. Each
+case runs against a scratch database file (wiped first). The six cases: insert/select
+round-trip, table-full, max-length strings, over-length strings, negative id, and
+**persistence** (insert + `.exit`, then reopen the same file and read it back).
 
 ```sh
 ctest --test-dir build --output-on-failure
@@ -566,6 +602,15 @@ layout into the compiler; `ALTER TABLE` is then impossible without changing C so
 ruler. Cost: a layer of indirection now. Payoff: runtime `CREATE TABLE` / `ALTER`
 later with no change to `record`, `table`, or `executor`.
 
+**Storage behind a cursor.** `execute_insert`/`execute_select` touch rows only
+through `cursor_value` / `cursor_advance`. They assume nothing about *how* the table
+is stored, so replacing the append-only page array with a B-tree is a change to the
+cursor and table internals — not to the executor.
+
+**The pager owns the file.** The page cache, file descriptor, and file length live in
+one place. `db_close` is the only durability point (flush-on-exit); there is no
+per-write journaling yet.
+
 **Address columns by stable `column_id`.** Never by name or ordinal. `RENAME` becomes
 a metadata edit; `DROP` becomes a flag; neither disturbs other columns' data.
 
@@ -577,14 +622,6 @@ unwind.
 NUL terminator. Bounding the print to `column->size` means `mini-sql` never had the
 "garbage bytes on max-length strings" bug the tutorial hits — and never needed the
 "+1 byte" struct fix, because there is no struct.
-
-**A file-static `default_schema`.** A deliberate stopgap: the parser needs *a* schema
-to build records, and there is no catalog yet. When the catalog lands, the parser
-will resolve a table by name and this global disappears.
-
-**Known simplification:** the negative-value check applies to all `INT` columns, not
-just a primary key — real SQL allows negative integers. This is a placeholder until
-`ColumnDefinition` grows real constraints.
 
 ---
 
@@ -598,7 +635,7 @@ flowchart LR
     P1["1 · REPL"] --> P2["2 · compiler skeleton"] --> P3["3 · in-memory table"] --> P4["4 · tests"]
     P4 --> P5["5 · pager / persistence"]
     P5 --> P6["6 · cursor abstraction"]
-    P6 --> P7["7–13 · B-tree"]
+    P6 --> P7["7–14 · B-tree"]
     P7 --> CAT["catalog"]
     CAT --> DDL["CREATE / ALTER TABLE"]
 
@@ -606,19 +643,20 @@ flowchart LR
     classDef now fill:#fff2cc,stroke:#bba12a;
     classDef todo fill:#eeeeee,stroke:#999999;
 
-    class P1,P2,P3,P4 done;
-    class P5 now;
-    class P6,P7,CAT,DDL todo;
+    class P1,P2,P3,P4,P5,P6 done;
+    class P7 now;
+    class CAT,DDL todo;
 ```
 
-- **Next — Pager (5):** replace `table.c`'s `void* pages[]` with a file-backed page
-  cache (`pager_open` / `pager_get_page` / `pager_flush` / `pager_close`). `Table`
-  trades its page array for a `Pager*` + root page. First time data survives a restart.
-- **Cursor (6):** a `Cursor` abstraction (start/end/advance/value) so insert and
-  select stop indexing pages directly — the seam the B-tree slots into.
-- **B-tree (7–13):** replace the append-only array with an ordered tree keyed by `id`;
-  leaf format → split → internal nodes → multi-level search and scan.
-- **Catalog + DDL:** name→table registry, then runtime `CREATE TABLE` and the
+- **Done — Pager (5):** `table.c`'s in-memory `void* pages[]` array is replaced by a
+  file-backed page cache (`pager_open` / `pager_get_page` / `pager_flush` /
+  `pager_close`). Data survives restarts.
+- **Done — Cursor (6):** `table_start` / `table_end` / `cursor_value` /
+  `cursor_advance`. Insert and select stop indexing pages directly.
+- **Next — B-tree (7–14):** replace the append-only array with an ordered tree keyed
+  by `id`; leaf format → binary search → leaf split → internal nodes → multi-level
+  search and scan. The cursor is the interface it plugs into.
+- **Then — Catalog + DDL:** a name→table registry, then runtime `CREATE TABLE` and the
   `ALTER TABLE ADD/DROP/RENAME COLUMN` family the schema layer was designed for.
 
 ---
@@ -633,7 +671,9 @@ mini-sql/
 │   ├── meta_command.h      # dot-commands
 │   ├── schema.h            # ColumnType, ColumnDefinition, Schema
 │   ├── record.h            # Record + (de)serialization
-│   ├── table.h             # Table + paging
+│   ├── pager.h             # Pager + page cache constants
+│   ├── table.h             # Table + db_open / db_close
+│   ├── cursor.h            # Cursor + start/end/value/advance
 │   ├── statement.h         # Statement, PrepareResult
 │   └── executor.h          # ExecuteResult, execute_statement
 ├── src/
@@ -641,7 +681,9 @@ mini-sql/
 │   ├── meta_command.c
 │   ├── schema.c
 │   ├── record.c
+│   ├── pager.c
 │   ├── table.c
+│   ├── cursor.c
 │   ├── statement.c
 │   ├── executor.c
 │   └── main.c              # REPL — the only file with no header
@@ -655,12 +697,16 @@ mini-sql/
 
 This is a learning engine. It is **not** trying to be:
 
-- **Persistent** — everything lives in process memory; `.exit` discards it. (Until Part 5.)
+- **Crash-safe** — pages are flushed only on a clean `.exit`; kill the process and
+  in-flight changes are lost. No rollback journal or WAL. (A known gap, not a design
+  goal yet.)
 - **A real SQL dialect** — `insert`/`select` only, fixed positional syntax, one
   hardcoded `users` table, no `WHERE` / `UPDATE` / `DELETE` / joins.
+- **Ordered / indexed** — storage is still an append-only array of pages; ordered
+  access arrives with the B-tree.
 - **A bytecode VM** — the executor runs statements directly; there is no parse tree,
   no code generator, no VDBE.
-- **Concurrent or durable** — single-threaded, no locking, no WAL, no transactions.
+- **Concurrent** — single-threaded, no locking.
 
 Each of those is a known gap with a place on the [roadmap](#roadmap), not an
 accident. The aim is a correct, legible core that grows one well-understood layer at
