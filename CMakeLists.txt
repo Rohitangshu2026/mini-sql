@@ -22,6 +22,7 @@ add_library(mini_sql_lib
     src/table.c
     src/pager.c
     src/cursor.c
+    src/btree.c
 )
 target_include_directories(mini_sql_lib PUBLIC include)
 
@@ -39,6 +40,8 @@ set(MINI_SQL_TESTS
     string_too_long
     negative_id
     persistence
+    constants
+    btree_one_node
 )
 foreach(t ${MINI_SQL_TESTS})
     add_test(

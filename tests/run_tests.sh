@@ -37,10 +37,10 @@ t_inserts_and_retrieves() {
 }
 
 t_table_full() {
-    # row_size = 4 + 32 + 255 = 291; 4096/291 = 14 rows/page * 100 pages = 1400 max.
-    # Inserting the 1401st must report the table is full.
+    # The table is a single leaf node for now: cell = 4 (key) + 291 (row) = 295
+    # bytes; (4096 - 10-byte header) / 295 = 13 cells. Insert #14 must fail.
     local script="" i
-    for i in $(seq 1 1401); do
+    for i in $(seq 1 14); do
         script+="insert $i user$i person$i@example.com"$'\n'
     done
     script+=".exit"$'\n'
@@ -80,7 +80,31 @@ t_persistence() {
     want "$out" "(1, user1, person1@example.com)"
 }
 
-ALL=(inserts_and_retrieves table_full max_length_strings string_too_long negative_id persistence)
+t_constants() {
+    # Our numbers differ from cstack's: row_size is 291 (no +1 null bytes),
+    # and the node format keeps uint32 fields 4-byte aligned (8-byte common
+    # header, cell padded 295 -> 296) so pointer accessors aren't UB.
+    local out
+    out=$(run $'.constants\n.exit\n')
+    want "$out" "ROW_SIZE: 291" &&
+    want "$out" "COMMON_NODE_HEADER_SIZE: 8" &&
+    want "$out" "LEAF_NODE_HEADER_SIZE: 12" &&
+    want "$out" "LEAF_NODE_CELL_SIZE: 296" &&
+    want "$out" "LEAF_NODE_SPACE_FOR_CELLS: 4084" &&
+    want "$out" "LEAF_NODE_MAX_CELLS: 13"
+}
+
+t_btree_one_node() {
+    # Keys print in insertion order for now — sorted insert arrives in Part 9.
+    local out
+    out=$(run $'insert 3 user3 person3@example.com\ninsert 1 user1 person1@example.com\ninsert 2 user2 person2@example.com\n.btree\n.exit\n')
+    want "$out" "leaf (size 3)" &&
+    want "$out" "  - 0 : 3" &&
+    want "$out" "  - 1 : 1" &&
+    want "$out" "  - 2 : 2"
+}
+
+ALL=(inserts_and_retrieves table_full max_length_strings string_too_long negative_id persistence constants btree_one_node)
 
 run_one() {
     if "t_$1"; then
