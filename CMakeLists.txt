@@ -45,6 +45,8 @@ set(MINI_SQL_TESTS
     btree_split
     btree_split_persists
     btree_insert_after_split
+    select_multilevel
+    select_empty
     multilevel_unimplemented
 )
 foreach(t ${MINI_SQL_TESTS})
@@ -54,3 +56,7 @@ foreach(t ${MINI_SQL_TESTS})
                 bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tests.sh ${t}
     )
 endforeach()
+
+# Scans follow on-disk sibling pointers, so a bad pointer can turn one into an
+# endless loop. Fail such a test fast instead of hanging for CTest's default.
+set_tests_properties(${MINI_SQL_TESTS} PROPERTIES TIMEOUT 10)

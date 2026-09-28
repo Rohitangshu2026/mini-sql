@@ -45,6 +45,20 @@ inserts() {
     done
 }
 
+# select_rows OUTPUT -> just the rows a select printed, one per line, with the
+# "db > " prompt that precedes the first one stripped off.
+select_rows() {
+    sed -nE 's/^(db > )?(\([0-9]+, .*\))$/\2/p' <<<"$1"
+}
+
+# expected_rows ID... -> the rows select should print for these ids, in order
+expected_rows() {
+    local id
+    for id in "$@"; do
+        printf '(%s, user%s, person%s@example.com)\n' "$id" "$id" "$id"
+    done
+}
+
 # The shape any 14-row insert order must produce: the full root leaf split
 # 7/7 under a new internal root whose one key is the left leaf's maximum.
 SPLIT_TREE=$(cat <<'EOF'
@@ -109,14 +123,15 @@ t_persistence() {
 t_constants() {
     # Our numbers differ from cstack's: row_size is 291 (no +1 null bytes),
     # and the node format keeps uint32 fields 4-byte aligned (8-byte common
-    # header, cell padded 295 -> 296) so pointer accessors aren't UB.
+    # header, cell padded 295 -> 296) so pointer accessors aren't UB. The leaf
+    # header is 16 bytes: common header, cell count, next-leaf pointer.
     local out
     out=$(run $'.constants\n.exit\n')
     want "$out" "ROW_SIZE: 291" &&
     want "$out" "COMMON_NODE_HEADER_SIZE: 8" &&
-    want "$out" "LEAF_NODE_HEADER_SIZE: 12" &&
+    want "$out" "LEAF_NODE_HEADER_SIZE: 16" &&
     want "$out" "LEAF_NODE_CELL_SIZE: 296" &&
-    want "$out" "LEAF_NODE_SPACE_FOR_CELLS: 4084" &&
+    want "$out" "LEAF_NODE_SPACE_FOR_CELLS: 4080" &&
     want "$out" "LEAF_NODE_MAX_CELLS: 13"
 }
 
@@ -194,16 +209,39 @@ EOF
     [[ "$(btree_block "$out")" == "$expected" ]]
 }
 
+t_select_multilevel() {
+    # A select must walk the leaf chain and return every row in key order.
+    # The four orders from t_btree_split each place the row inserted *during*
+    # the split somewhere different, so a split that misplaced that row's key
+    # or value would show up here as a row whose id and name disagree.
+    local order out
+    for order in "$(seq 1 14)" "$(seq 14 -1 1)" "$(seq 1 6) $(seq 8 14) 7" "$(seq 1 7) $(seq 9 14) 8"; do
+        out=$(run "$(inserts $order 15)"$'\nselect\n.exit\n')
+        [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 15))" ]] || return 1
+    done
+
+    # 20 rows fill the right leaf completely; the chain must survive a reopen.
+    rm -f "$TESTDB"
+    { inserts $(seq 1 20); printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
+    out=$(printf 'select\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 20))" ]]
+}
+
+t_select_empty() {
+    # A scan of an empty table starts by searching the empty root leaf for
+    # key 0; that must mean "nothing to scan", not a phantom row.
+    local out
+    out=$(run $'select\n.exit\n')
+    [[ -z "$(select_rows "$out")" ]] && want "$out" "Executed."
+}
+
 t_multilevel_unimplemented() {
-    # Pins the two boundaries still standing. Splitting a leaf that isn't the
-    # root needs its parent updated: ascending inserts fill the right leaf at
-    # row 20, so row 21 must stop there, right after row 20 succeeds. And a
-    # scan still can't start in a multi-level tree. Later stages flip these.
+    # Pins the boundary still standing: splitting a leaf that isn't the root
+    # needs its parent updated. Ascending inserts fill the right leaf at row
+    # 20, so row 21 must stop there, right after row 20 succeeds.
     local out
     out=$(run "$(inserts $(seq 1 21))"$'\n.exit\n')
-    [[ "$(tail -n 2 <<<"$out")" == $'db > Executed.\ndb > Need to implement updating parent after split' ]] || return 1
-    out=$(run "$(inserts $(seq 1 14))"$'\nselect\n.exit\n')
-    want "$out" "Need to implement scanning a multi-level tree"
+    [[ "$(tail -n 2 <<<"$out")" == $'db > Executed.\ndb > Need to implement updating parent after split' ]]
 }
 
 t_duplicate_key() {
@@ -214,7 +252,7 @@ t_duplicate_key() {
     [[ $(grep -cF '(1, user1, person1@example.com)' <<<"$out") -eq 1 ]]
 }
 
-ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split multilevel_unimplemented)
+ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split select_multilevel select_empty multilevel_unimplemented)
 
 run_one() {
     if "t_$1"; then

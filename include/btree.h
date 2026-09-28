@@ -47,6 +47,13 @@ uint32_t leaf_node_max_cells(const Schema* schema);
 /* Pointer to the leaf's cell-count field. */
 uint32_t* leaf_node_num_cells(void* node);
 
+/*
+ * Pointer to the page number of the leaf's right sibling, or 0 for the
+ * rightmost leaf. Chaining leaves this way lets a scan walk every row in key
+ * order without going back up through the internal nodes.
+ */
+uint32_t* leaf_node_next_leaf(void* node);
+
 /* Pointer to the key of cell `cell_num`. */
 uint32_t* leaf_node_key(void* node, uint32_t cell_num, const Schema* schema);
 

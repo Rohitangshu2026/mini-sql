@@ -16,12 +16,11 @@
  *
  * Rows live only in leaves, and cursor_value / cursor_advance read leaf cells
  * directly, so a cursor on an internal node would read routing data (child page
- * numbers and separator keys) as if it were rows. The invariant is established
- * where cursors are created — table_start and table_find are the only
- * constructors — and asserted where it's relied on. table_find satisfies it by
- * construction, descending until it reaches a leaf. table_start can't descend
- * yet, so it refuses a tree whose root is internal rather than hand back a
- * cursor that would violate it.
+ * numbers and separator keys) as if it were rows. The invariant holds by
+ * construction: table_start and table_find are the only constructors, and both
+ * reach their leaf through the same descent from the root, which stops only at
+ * a leaf. cursor_advance preserves it by moving only along the chain of leaves,
+ * and the functions that read cells assert it.
  */
 typedef struct{
     Table* table;
@@ -31,8 +30,8 @@ typedef struct{
 }Cursor;
 
 /*
- * Cursor at the first cell of the table (end_of_table if the table is empty).
- * Refuses, for now, a tree whose root is internal; see the invariant above.
+ * Cursor at the first cell of the table — cell 0 of the leftmost leaf — with
+ * end_of_table set if the table is empty.
  */
 Cursor* table_start(Table* table);
 
@@ -47,7 +46,11 @@ Cursor* table_find(Table* table, uint32_t key);
 /* Pointer to the value (serialized row) the cursor points at. */
 void* cursor_value(Cursor* cursor);
 
-/* Moves the cursor to the next cell, setting end_of_table when it runs off. */
+/*
+ * Moves the cursor to the next cell in key order, crossing into the next leaf
+ * after the last cell of this one, and setting end_of_table after the last
+ * cell of the rightmost leaf.
+ */
 void cursor_advance(Cursor* cursor);
 
 #endif

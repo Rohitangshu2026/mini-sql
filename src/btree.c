@@ -26,10 +26,15 @@
 #define COMMON_NODE_HEADER_SIZE 8u
 
 /*
- * Leaf node header: the common header followed by a 4-byte cell count.
+ * Leaf node header: the common header, a 4-byte cell count, then the page
+ * number of the next leaf to the right. Following next_leaf from the leftmost
+ * leaf visits every row in key order, which is how a scan crosses leaves. Zero
+ * means "no right sibling": page 0 always holds the root, which is never anyone's
+ * sibling, so it is free to serve as the sentinel.
  */
 #define LEAF_NODE_NUM_CELLS_OFFSET COMMON_NODE_HEADER_SIZE
-#define LEAF_NODE_HEADER_SIZE      (COMMON_NODE_HEADER_SIZE + 4u)
+#define LEAF_NODE_NEXT_LEAF_OFFSET (COMMON_NODE_HEADER_SIZE + 4u)
+#define LEAF_NODE_HEADER_SIZE      (COMMON_NODE_HEADER_SIZE + 8u)
 
 /*
  * Leaf node body: an array of cells, each a 4-byte key followed by a serialized
@@ -110,6 +115,11 @@ uint32_t* leaf_node_num_cells(void* node){
     return (uint32_t*)((char*)node + LEAF_NODE_NUM_CELLS_OFFSET);
 }
 
+/* Pointer to the page number of the leaf's right sibling (0 if it has none). */
+uint32_t* leaf_node_next_leaf(void* node){
+    return (uint32_t*)((char*)node + LEAF_NODE_NEXT_LEAF_OFFSET);
+}
+
 /* Address of the start of cell `cell_num` (i.e. its key). */
 static void* leaf_node_cell(void* node, uint32_t cell_num, const Schema* schema){
     return (char*)node + LEAF_NODE_HEADER_SIZE + cell_num * leaf_node_cell_size(schema);
@@ -155,9 +165,10 @@ uint32_t leaf_node_find_cell(void* node, uint32_t key, const Schema* schema){
 }
 
 /*
- * Prepares a fresh page as an empty leaf. It starts life as a non-root: the one
- * caller that installs a leaf as a tree's root (db_open, for a new file) sets
- * the flag explicitly afterwards. The kind is stamped so the page describes
+ * Prepares a fresh page as an empty leaf. It starts life as a non-root with no
+ * right sibling: the one caller that installs a leaf as a tree's root (db_open,
+ * for a new file) sets the root flag explicitly afterwards, and a split links
+ * a new leaf into the chain itself. The kind is stamped so the page describes
  * itself — cursors dispatch on it, and a leftover header byte would send them
  * down the wrong branch.
  */
@@ -165,6 +176,7 @@ void initialize_leaf_node(void* node){
     set_node_type(node, NODE_LEAF);
     set_node_root(node, false);
     *leaf_node_num_cells(node) = 0;
+    *leaf_node_next_leaf(node) = 0;
 }
 
 /* Pointer to the internal node's key-count field. */
@@ -316,9 +328,10 @@ static void create_new_root(Pager* pager, uint32_t root_page_num, uint32_t right
  * serializes the row at the start of the cell and never writes the key, a bug
  * hidden by the id happening to be both the key and the row's first field.
  *
- * If the node was the root, a new root is created above the two halves.
- * Otherwise the existing parent would need a new key and child, which isn't
- * implemented yet; it can't happen while a split root stops further inserts.
+ * The new node is spliced into the leaf chain directly after the old one, so a
+ * scan still meets the two halves in key order. If the node was the root, a new
+ * root is created above the two halves. Otherwise the existing parent would
+ * need a new key and child, which isn't implemented yet.
  */
 static void leaf_node_split_and_insert(Pager* pager, uint32_t page_num, uint32_t cell_num,
                                        uint32_t key, const Record* value, const Schema* schema){
@@ -326,6 +339,15 @@ static void leaf_node_split_and_insert(Pager* pager, uint32_t page_num, uint32_t
     uint32_t new_page_num = get_unused_page_num(pager);
     void* new_node = pager_get_page(pager, new_page_num);
     initialize_leaf_node(new_node);
+
+    /*
+     * Linked-list insertion into the leaf chain: the new node inherits the old
+     * node's right sibling, then becomes that sibling. The old pointer has to be
+     * read before it's overwritten, or the new node would point at itself and
+     * every scan would loop forever.
+     */
+    *leaf_node_next_leaf(new_node) = *leaf_node_next_leaf(old_node);
+    *leaf_node_next_leaf(old_node) = new_page_num;
 
     uint32_t total_cells = leaf_node_max_cells(schema) + 1;
     uint32_t right_split_count = total_cells / 2;
