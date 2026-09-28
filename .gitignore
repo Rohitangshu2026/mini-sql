@@ -20,5 +20,8 @@ compile_commands.json
 *.swp
 *.swo
 
+# Database files created by running the REPL
+*.db
+
 # macOS
 .DS_Store

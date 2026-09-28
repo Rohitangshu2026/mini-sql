@@ -7,7 +7,8 @@
 /* Outcome of running a statement against a table. */
 typedef enum{
     EXECUTE_SUCCESS,
-    EXECUTE_TABLE_FULL   /* the (single) leaf node has no room left */
+    EXECUTE_DUPLICATE_KEY,   /* a row with that primary key already exists */
+    EXECUTE_TABLE_FULL       /* the (single) leaf node has no room left */
 }ExecuteResult;
 
 /*

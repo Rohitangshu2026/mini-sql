@@ -1,6 +1,7 @@
 #include "cursor.h"
 #include "btree.h"
 
+#include<stdio.h>
 #include<stdlib.h>
 
 /*
@@ -21,18 +22,28 @@ Cursor* table_start(Table* table){
 }
 
 /*
- * Creates a cursor one past the last cell of the root leaf — the position an
- * appended row is written to. end_of_table is true because the cursor does not
- * point at an existing cell.
+ * Finds where `key` lives, or belongs, in the tree.
+ *
+ * Navigation starts at the root and dispatches on the node's kind. A root leaf
+ * is searched directly; an internal node would mean descending to the right
+ * child first, which has no implementation yet, so that path aborts loudly
+ * rather than silently returning a wrong position. end_of_table reflects
+ * whether the resolved cell actually exists, keeping the flag's meaning the
+ * same as it is for a scan cursor.
  */
-Cursor* table_end(Table* table){
+Cursor* table_find(Table* table, uint32_t key){
+    void* root_node = pager_get_page(table->pager, table->root_page_num);
+
+    if(get_node_type(root_node) != NODE_LEAF){
+        printf("Need to implement searching an internal node\n");
+        exit(EXIT_FAILURE);
+    }
+
     Cursor* cursor = malloc(sizeof(Cursor));
     cursor->table = table;
     cursor->page_num = table->root_page_num;
-
-    void* root_node = pager_get_page(table->pager, table->root_page_num);
-    cursor->cell_num = *leaf_node_num_cells(root_node);
-    cursor->end_of_table = true;
+    cursor->cell_num = leaf_node_find_cell(root_node, key, table->schema);
+    cursor->end_of_table = (cursor->cell_num >= *leaf_node_num_cells(root_node));
 
     return cursor;
 }

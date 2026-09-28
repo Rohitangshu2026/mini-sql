@@ -22,8 +22,13 @@ typedef struct{
 /* Cursor at the first cell of the table (end_of_table if the table is empty). */
 Cursor* table_start(Table* table);
 
-/* Cursor one past the last cell — the position a new row is appended at. */
-Cursor* table_end(Table* table);
+/*
+ * Cursor at `key`'s position, or at the position it would occupy if absent —
+ * which is what makes it serve double duty as "find" and "where to insert".
+ * This is the entry point for tree navigation: today it only handles a root
+ * leaf, and grows the descent through internal nodes in a later part.
+ */
+Cursor* table_find(Table* table, uint32_t key);
 
 /* Pointer to the value (serialized row) the cursor points at. */
 void* cursor_value(Cursor* cursor);

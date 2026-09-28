@@ -95,16 +95,25 @@ t_constants() {
 }
 
 t_btree_one_node() {
-    # Keys print in insertion order for now — sorted insert arrives in Part 9.
+    # Inserted 3, 1, 2 but stored sorted: insert now seeks the key's position
+    # instead of appending.
     local out
     out=$(run $'insert 3 user3 person3@example.com\ninsert 1 user1 person1@example.com\ninsert 2 user2 person2@example.com\n.btree\n.exit\n')
     want "$out" "leaf (size 3)" &&
-    want "$out" "  - 0 : 3" &&
-    want "$out" "  - 1 : 1" &&
-    want "$out" "  - 2 : 2"
+    want "$out" "  - 0 : 1" &&
+    want "$out" "  - 1 : 2" &&
+    want "$out" "  - 2 : 3"
 }
 
-ALL=(inserts_and_retrieves table_full max_length_strings string_too_long negative_id persistence constants btree_one_node)
+t_duplicate_key() {
+    # The second insert of id 1 must be rejected, leaving exactly one row.
+    local out
+    out=$(run $'insert 1 user1 person1@example.com\ninsert 1 user1 person1@example.com\nselect\n.exit\n')
+    want "$out" "Error: Duplicate key." &&
+    [[ $(grep -cF '(1, user1, person1@example.com)' <<<"$out") -eq 1 ]]
+}
+
+ALL=(inserts_and_retrieves table_full max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key)
 
 run_one() {
     if "t_$1"; then

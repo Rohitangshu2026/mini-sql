@@ -57,6 +57,21 @@ uint32_t leaf_node_max_cells(const Schema* schema){
     return (PAGE_SIZE - LEAF_NODE_HEADER_SIZE) / leaf_node_cell_size(schema);
 }
 
+/*
+ * Reads the node-kind byte. Stored as a uint8_t rather than the enum so the
+ * on-disk format doesn't depend on how wide the compiler makes NodeType.
+ */
+NodeType get_node_type(void* node){
+    uint8_t value = *((uint8_t*)((char*)node + NODE_TYPE_OFFSET));
+    return (NodeType)value;
+}
+
+/* Writes the node-kind byte. Mirror of get_node_type. */
+void set_node_type(void* node, NodeType type){
+    uint8_t value = (uint8_t)type;
+    *((uint8_t*)((char*)node + NODE_TYPE_OFFSET)) = value;
+}
+
 /* Pointer to the leaf's cell-count field, for reading or writing. */
 uint32_t* leaf_node_num_cells(void* node){
     return (uint32_t*)((char*)node + LEAF_NODE_NUM_CELLS_OFFSET);
@@ -77,8 +92,42 @@ void* leaf_node_value(void* node, uint32_t cell_num, const Schema* schema){
     return (char*)leaf_node_cell(node, cell_num, schema) + LEAF_NODE_KEY_SIZE;
 }
 
-/* Marks a fresh page as an empty leaf by zeroing its cell count. */
+/*
+ * Locates `key` among the cells, which insert keeps in ascending key order.
+ *
+ * Standard binary search over the half-open range [min_index,
+ * one_past_max_index). On an exact hit the cell's own index comes back; on a
+ * miss the loop converges on the first index whose key is greater than `key`,
+ * which is precisely where the key would have to be inserted to keep the node
+ * sorted. That index equals the cell count when the key sorts after every
+ * existing cell, so callers must bounds-check before dereferencing it.
+ */
+uint32_t leaf_node_find_cell(void* node, uint32_t key, const Schema* schema){
+    uint32_t min_index = 0;
+    uint32_t one_past_max_index = *leaf_node_num_cells(node);
+
+    while(one_past_max_index != min_index){
+        uint32_t index = (min_index + one_past_max_index) / 2;
+        uint32_t key_at_index = *leaf_node_key(node, index, schema);
+
+        if(key == key_at_index)
+            return index;
+        if(key < key_at_index)
+            one_past_max_index = index;
+        else
+            min_index = index + 1;
+    }
+
+    return min_index;
+}
+
+/*
+ * Prepares a fresh page as an empty leaf. The kind is stamped here so a node is
+ * self-describing from birth — table_find dispatches on it, and a page left
+ * with a garbage header byte would route down the wrong branch.
+ */
 void initialize_leaf_node(void* node){
+    set_node_type(node, NODE_LEAF);
     *leaf_node_num_cells(node) = 0;
 }
 

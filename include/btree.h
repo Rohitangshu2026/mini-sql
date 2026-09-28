@@ -10,11 +10,20 @@
  * Node kinds in the b-tree. Internal nodes route by key and point at children;
  * leaf nodes hold the actual cells (key + serialized row). Only leaf nodes
  * exist so far — this module gains internal-node support in later parts.
+ *
+ * The kind is stored in the node's header byte, so a page can describe itself:
+ * callers dispatch on get_node_type() rather than assuming what a page holds.
  */
 typedef enum{
     NODE_INTERNAL,
     NODE_LEAF
 }NodeType;
+
+/* Reads the node's kind from its header. */
+NodeType get_node_type(void* node);
+
+/* Stamps the node's kind into its header, as a single byte. */
+void set_node_type(void* node, NodeType type);
 
 /*
  * Every node occupies exactly one page. A leaf node's cell size depends on the
@@ -35,7 +44,14 @@ uint32_t* leaf_node_key(void* node, uint32_t cell_num, const Schema* schema);
 /* Pointer to the value (serialized row) of cell `cell_num`. */
 void* leaf_node_value(void* node, uint32_t cell_num, const Schema* schema);
 
-/* Turns a fresh page into an empty leaf node (cell count = 0). */
+/*
+ * Binary-searches a leaf's sorted cells for `key`. Returns the index of the
+ * matching cell if present, otherwise the index the key belongs at — which may
+ * be the cell count itself, meaning "past the last cell".
+ */
+uint32_t leaf_node_find_cell(void* node, uint32_t key, const Schema* schema);
+
+/* Turns a fresh page into an empty leaf node (typed, cell count = 0). */
 void initialize_leaf_node(void* node);
 
 /*

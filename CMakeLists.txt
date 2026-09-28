@@ -42,6 +42,7 @@ set(MINI_SQL_TESTS
     persistence
     constants
     btree_one_node
+    duplicate_key
 )
 foreach(t ${MINI_SQL_TESTS})
     add_test(

@@ -8,19 +8,36 @@
 #define KEY_COLUMN_ID 1
 
 /*
- * Appends a row to the table's single leaf node. Capacity is checked up front
- * (splitting a full node isn't implemented yet, so we surface TABLE_FULL rather
- * than let leaf_node_insert abort). The key is pulled from the row's id column;
- * a cursor at the end of the table gives the slot to write into.
+ * Inserts a row at its sorted position rather than appending it.
+ *
+ * Capacity is checked up front (splitting a full node isn't implemented yet, so
+ * we surface TABLE_FULL rather than let leaf_node_insert abort). The row's id
+ * column supplies the key, and table_find resolves where that key belongs.
+ *
+ * Because table_find returns an insertion point for a key that isn't present,
+ * a cursor landing on an existing cell is the signal to inspect it: if the key
+ * there matches, the primary key is already taken and the insert is rejected.
+ * The bounds check matters — the cursor can legitimately sit one past the last
+ * cell, and reading a key there would be off the end of the live cells.
  */
 static ExecuteResult execute_insert(Statement* statement, Table* table){
     void* node = pager_get_page(table->pager, table->root_page_num);
-    if(*leaf_node_num_cells(node) >= leaf_node_max_cells(table->schema))
+    uint32_t num_cells = *leaf_node_num_cells(node);
+    if(num_cells >= leaf_node_max_cells(table->schema))
         return EXECUTE_TABLE_FULL;
 
     uint32_t key = (uint32_t)record_get_int(&statement->record_to_insert, table->schema, KEY_COLUMN_ID);
 
-    Cursor* cursor = table_end(table);
+    Cursor* cursor = table_find(table, key);
+
+    if(cursor->cell_num < num_cells){
+        uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num, table->schema);
+        if(key_at_index == key){
+            free(cursor);
+            return EXECUTE_DUPLICATE_KEY;
+        }
+    }
+
     void* leaf = pager_get_page(table->pager, cursor->page_num);
     leaf_node_insert(leaf, cursor->cell_num, key, &statement->record_to_insert, table->schema);
     free(cursor);
