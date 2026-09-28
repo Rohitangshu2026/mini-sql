@@ -208,6 +208,38 @@ uint32_t* internal_node_key(void* node, uint32_t key_num){
     return (uint32_t*)((char*)internal_node_cell(node, key_num) + INTERNAL_NODE_CHILD_SIZE);
 }
 
+/*
+ * Chooses which child of an internal node to descend into for `key`.
+ *
+ * Each separator key is the largest key stored under the child to its left,
+ * so `key` belongs to the first child whose separator is >= key, and to the
+ * rightmost child if it is greater than every separator. That is a lower-bound
+ * binary search over [min_index, max_index), with max_index starting at
+ * num_keys rather than num_keys - 1 because there is one more child than there
+ * are keys: landing on num_keys means "the right child". A key equal to a
+ * separator goes left, since that separator is the left child's maximum —
+ * sending it right would miss the row that holds it.
+ *
+ * The probe index is always strictly below max_index, and so below num_keys,
+ * which means only keys that actually exist are ever read.
+ */
+uint32_t internal_node_find_child(void* node, uint32_t key){
+    uint32_t min_index = 0;
+    uint32_t max_index = *internal_node_num_keys(node);
+
+    while(min_index != max_index){
+        uint32_t index = (min_index + max_index) / 2;
+        uint32_t key_to_right = *internal_node_key(node, index);
+
+        if(key_to_right >= key)
+            max_index = index;
+        else
+            min_index = index + 1;
+    }
+
+    return min_index;
+}
+
 /* Prepares a page as an empty, non-root internal node. */
 static void initialize_internal_node(void* node){
     set_node_type(node, NODE_INTERNAL);

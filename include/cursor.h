@@ -18,9 +18,10 @@
  * directly, so a cursor on an internal node would read routing data (child page
  * numbers and separator keys) as if it were rows. The invariant is established
  * where cursors are created — table_start and table_find are the only
- * constructors — and asserted where it's relied on. Until search and scan can
- * descend through internal nodes, both constructors refuse a tree whose root is
- * internal rather than hand back a cursor that would violate it.
+ * constructors — and asserted where it's relied on. table_find satisfies it by
+ * construction, descending until it reaches a leaf. table_start can't descend
+ * yet, so it refuses a tree whose root is internal rather than hand back a
+ * cursor that would violate it.
  */
 typedef struct{
     Table* table;
@@ -38,7 +39,8 @@ Cursor* table_start(Table* table);
 /*
  * Cursor at `key`'s position, or at the position it would occupy if absent —
  * which is what makes it serve double duty as "find" and "where to insert".
- * Refuses, for now, a tree whose root is internal; see the invariant above.
+ * Descends from the root through internal nodes to the leaf that owns `key`,
+ * so it works on a tree of any height.
  */
 Cursor* table_find(Table* table, uint32_t key);
 

@@ -92,6 +92,13 @@ uint32_t* internal_node_child(void* node, uint32_t child_num);
 /* Pointer to key `key_num`: the largest key in the child to its left. */
 uint32_t* internal_node_key(void* node, uint32_t key_num);
 
+/*
+ * Binary-searches an internal node's separator keys for the child whose
+ * subtree owns `key`. Returns a child index in [0, num_keys], where num_keys
+ * means the rightmost child; pass it to internal_node_child for the page.
+ */
+uint32_t internal_node_find_child(void* node, uint32_t key);
+
 /* Prints the layout constants (used by the .constants meta command). */
 void print_constants(const Schema* schema);
 

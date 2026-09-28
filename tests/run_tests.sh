@@ -154,13 +154,54 @@ t_btree_split_persists() {
     [[ "$(btree_block "$out")" == "$SPLIT_TREE" ]]
 }
 
+t_btree_insert_after_split() {
+    # Even ids 2-28 split into 2-14 | 16-28 under separator 14. Later inserts
+    # must descend through the internal root to the right leaf:
+    #   3  -> left              15 -> right (separator + 1)
+    #   29 -> the right child, past every separator
+    #   1  -> left, below every key
+    #   14 -> equals the separator, so it must route LEFT, where that row
+    #         already lives, and be rejected as a duplicate
+    #   28 -> a duplicate found in the right leaf
+    local out expected
+    out=$(run "$(inserts $(seq 2 2 28) 3 15 29 1 14 28)"$'\n.btree\n.exit\n')
+    [[ $(grep -cF 'Error: Duplicate key.' <<<"$out") -eq 2 ]] || return 1
+    expected=$(cat <<'EOF'
+- internal (size 1)
+  - leaf (size 9)
+    - 1
+    - 2
+    - 3
+    - 4
+    - 6
+    - 8
+    - 10
+    - 12
+    - 14
+  - key 14
+  - leaf (size 9)
+    - 15
+    - 16
+    - 18
+    - 20
+    - 22
+    - 24
+    - 26
+    - 28
+    - 29
+EOF
+)
+    [[ "$(btree_block "$out")" == "$expected" ]]
+}
+
 t_multilevel_unimplemented() {
-    # Pins the two boundaries this stage leaves behind: once the root has
-    # split, searching (insert) and scanning (select) must refuse loudly
-    # rather than read the internal root as a leaf. Later stages flip these.
+    # Pins the two boundaries still standing. Splitting a leaf that isn't the
+    # root needs its parent updated: ascending inserts fill the right leaf at
+    # row 20, so row 21 must stop there, right after row 20 succeeds. And a
+    # scan still can't start in a multi-level tree. Later stages flip these.
     local out
-    out=$(run "$(inserts $(seq 1 15))"$'\n.exit\n')
-    want "$out" "Need to implement searching an internal node" || return 1
+    out=$(run "$(inserts $(seq 1 21))"$'\n.exit\n')
+    [[ "$(tail -n 2 <<<"$out")" == $'db > Executed.\ndb > Need to implement updating parent after split' ]] || return 1
     out=$(run "$(inserts $(seq 1 14))"$'\nselect\n.exit\n')
     want "$out" "Need to implement scanning a multi-level tree"
 }
@@ -173,7 +214,7 @@ t_duplicate_key() {
     [[ $(grep -cF '(1, user1, person1@example.com)' <<<"$out") -eq 1 ]]
 }
 
-ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists multilevel_unimplemented)
+ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split multilevel_unimplemented)
 
 run_one() {
     if "t_$1"; then

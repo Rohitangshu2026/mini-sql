@@ -44,6 +44,7 @@ set(MINI_SQL_TESTS
     duplicate_key
     btree_split
     btree_split_persists
+    btree_insert_after_split
     multilevel_unimplemented
 )
 foreach(t ${MINI_SQL_TESTS})
