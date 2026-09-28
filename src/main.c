@@ -93,9 +93,6 @@ int main(int argc, char* argv[]){
             case EXECUTE_DUPLICATE_KEY:
                 printf("Error: Duplicate key.\n");
                 break;
-            case EXECUTE_TABLE_FULL:
-                printf("Error: Table full.\n");
-                break;
         }
     }
 }

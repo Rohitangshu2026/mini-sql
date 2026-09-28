@@ -7,14 +7,13 @@
 /* Outcome of running a statement against a table. */
 typedef enum{
     EXECUTE_SUCCESS,
-    EXECUTE_DUPLICATE_KEY,   /* a row with that primary key already exists */
-    EXECUTE_TABLE_FULL       /* the (single) leaf node has no room left */
+    EXECUTE_DUPLICATE_KEY   /* a row with that primary key already exists */
 }ExecuteResult;
 
 /*
- * Runs a prepared statement: appends the row for an insert, prints every row
- * for a select. All storage access goes through a cursor, so the executor is
- * unaware of the b-tree layout.
+ * Runs a prepared statement: inserts the row at its sorted position for an
+ * insert, prints every row for a select. All storage access goes through a
+ * cursor, so the executor is unaware of the b-tree layout.
  */
 ExecuteResult execute_statement(Statement* statement, Table* table);
 

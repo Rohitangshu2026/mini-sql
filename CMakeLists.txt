@@ -35,7 +35,6 @@ target_link_libraries(mini_sql PRIVATE mini_sql_lib)
 enable_testing()
 set(MINI_SQL_TESTS
     inserts_and_retrieves
-    table_full
     max_length_strings
     string_too_long
     negative_id
@@ -43,6 +42,9 @@ set(MINI_SQL_TESTS
     constants
     btree_one_node
     duplicate_key
+    btree_split
+    btree_split_persists
+    multilevel_unimplemented
 )
 foreach(t ${MINI_SQL_TESTS})
     add_test(

@@ -39,6 +39,15 @@ Pager* pager_open(const char* filename);
  */
 void* pager_get_page(Pager* pager, uint32_t page_num);
 
+/*
+ * Returns the page number a newly created node should occupy: the first page
+ * past the current end of the database. Nothing is reserved — num_pages only
+ * advances once that page is fetched with pager_get_page — so a caller must
+ * fetch the page it was given before asking for another, or it will be handed
+ * the same number twice.
+ */
+uint32_t get_unused_page_num(Pager* pager);
+
 /* Writes one whole page back to its offset in the file. Exits on I/O error. */
 void pager_flush(Pager* pager, uint32_t page_num);
 

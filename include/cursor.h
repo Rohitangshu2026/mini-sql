@@ -9,8 +9,18 @@
 /*
  * A position within a table: the page holding a leaf node and the cell within
  * that node. The executor moves and dereferences a cursor without knowing how
- * the tree is laid out, so the storage engine can grow more levels later
- * without the executor changing.
+ * the tree is laid out, so the storage engine can grow more levels without the
+ * executor changing.
+ *
+ * Invariant: a Cursor always addresses a leaf node.
+ *
+ * Rows live only in leaves, and cursor_value / cursor_advance read leaf cells
+ * directly, so a cursor on an internal node would read routing data (child page
+ * numbers and separator keys) as if it were rows. The invariant is established
+ * where cursors are created — table_start and table_find are the only
+ * constructors — and asserted where it's relied on. Until search and scan can
+ * descend through internal nodes, both constructors refuse a tree whose root is
+ * internal rather than hand back a cursor that would violate it.
  */
 typedef struct{
     Table* table;
@@ -19,14 +29,16 @@ typedef struct{
     bool end_of_table;    /* true when positioned one past the last cell */
 }Cursor;
 
-/* Cursor at the first cell of the table (end_of_table if the table is empty). */
+/*
+ * Cursor at the first cell of the table (end_of_table if the table is empty).
+ * Refuses, for now, a tree whose root is internal; see the invariant above.
+ */
 Cursor* table_start(Table* table);
 
 /*
  * Cursor at `key`'s position, or at the position it would occupy if absent —
  * which is what makes it serve double duty as "find" and "where to insert".
- * This is the entry point for tree navigation: today it only handles a root
- * leaf, and grows the descent through internal nodes in a later part.
+ * Refuses, for now, a tree whose root is internal; see the invariant above.
  */
 Cursor* table_find(Table* table, uint32_t key);
 

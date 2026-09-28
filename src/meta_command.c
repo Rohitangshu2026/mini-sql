@@ -9,7 +9,7 @@
  * Handles the "." commands.
  *
  *   .exit       flush and close the database, then terminate the process.
- *   .btree      print the root leaf node (cell count + keys) for debugging.
+ *   .btree      print the whole tree, one node per line, indented by depth.
  *   .constants  print the on-page layout sizes.
  *
  * The debugging commands return META_COMMAND_SUCCESS so the REPL resumes;
@@ -24,7 +24,7 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table){
     }
     if(strcmp(input_buffer->buffer, ".btree") == 0){
         printf("Tree:\n");
-        print_leaf_node(pager_get_page(table->pager, table->root_page_num), table->schema);
+        print_tree(table->pager, table->schema, table->root_page_num, 0);
         return META_COMMAND_SUCCESS;
     }
     if(strcmp(input_buffer->buffer, ".constants") == 0){

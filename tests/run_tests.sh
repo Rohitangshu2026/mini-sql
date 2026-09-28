@@ -30,23 +30,49 @@ want() {
     grep -qF -- "$2" <<<"$1"
 }
 
+# btree_block OUTPUT -> just the tree printed by .btree: every line after the
+# "Tree:" header up to the next prompt. Lets tests compare a tree's shape
+# exactly — substring checks can't, since "- 1" also matches "- 10".
+btree_block() {
+    awk '/Tree:$/{f=1; next} /^db >/{f=0} f' <<<"$1"
+}
+
+# inserts ID... -> a script inserting one row per id, in the order given
+inserts() {
+    local id
+    for id in "$@"; do
+        printf 'insert %s user%s person%s@example.com\n' "$id" "$id" "$id"
+    done
+}
+
+# The shape any 14-row insert order must produce: the full root leaf split
+# 7/7 under a new internal root whose one key is the left leaf's maximum.
+SPLIT_TREE=$(cat <<'EOF'
+- internal (size 1)
+  - leaf (size 7)
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+  - key 7
+  - leaf (size 7)
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+EOF
+)
+
 t_inserts_and_retrieves() {
     local out
     out=$(run $'insert 1 user1 person1@example.com\nselect\n.exit\n')
     want "$out" "db > (1, user1, person1@example.com)"
-}
-
-t_table_full() {
-    # The table is a single leaf node for now: cell = 4 (key) + 291 (row) = 295
-    # bytes; (4096 - 10-byte header) / 295 = 13 cells. Insert #14 must fail.
-    local script="" i
-    for i in $(seq 1 14); do
-        script+="insert $i user$i person$i@example.com"$'\n'
-    done
-    script+=".exit"$'\n'
-    local out
-    out=$(run "$script")
-    want "$out" "Error: Table full."
 }
 
 t_max_length_strings() {
@@ -95,14 +121,48 @@ t_constants() {
 }
 
 t_btree_one_node() {
-    # Inserted 3, 1, 2 but stored sorted: insert now seeks the key's position
+    # Inserted 3, 1, 2 but stored sorted: insert seeks the key's position
     # instead of appending.
+    local out expected
+    out=$(run "$(inserts 3 1 2)"$'\n.btree\n.exit\n')
+    expected=$'- leaf (size 3)\n  - 1\n  - 2\n  - 3'
+    [[ "$(btree_block "$out")" == "$expected" ]]
+}
+
+t_btree_split() {
+    # The 14th row overflows the root leaf. Each order below drives the split
+    # loop down a different branch, and every one must yield the same tree:
+    #   ascending        -> new key lands at the tail, in the right node
+    #   descending       -> new key lands at the head, in the left node
+    #   1-6, 8-14, 7     -> new key is the left node's last cell
+    #   1-7, 9-14, 8     -> new key is the right node's first cell (the
+    #                       exact left/right boundary, the likeliest off-by-one)
+    local order out
+    for order in "$(seq 1 14)" "$(seq 14 -1 1)" "$(seq 1 6) $(seq 8 14) 7" "$(seq 1 7) $(seq 9 14) 8"; do
+        out=$(run "$(inserts $order)"$'\n.btree\n.exit\n')
+        [[ "$(btree_block "$out")" == "$SPLIT_TREE" ]] || return 1
+    done
+}
+
+t_btree_split_persists() {
+    # A split leaves three pages; all must reach disk, and the root must be
+    # read back as an internal node when the file is reopened.
+    rm -f "$TESTDB"
+    { inserts $(seq 1 14); printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
     local out
-    out=$(run $'insert 3 user3 person3@example.com\ninsert 1 user1 person1@example.com\ninsert 2 user2 person2@example.com\n.btree\n.exit\n')
-    want "$out" "leaf (size 3)" &&
-    want "$out" "  - 0 : 1" &&
-    want "$out" "  - 1 : 2" &&
-    want "$out" "  - 2 : 3"
+    out=$(printf '.btree\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    [[ "$(btree_block "$out")" == "$SPLIT_TREE" ]]
+}
+
+t_multilevel_unimplemented() {
+    # Pins the two boundaries this stage leaves behind: once the root has
+    # split, searching (insert) and scanning (select) must refuse loudly
+    # rather than read the internal root as a leaf. Later stages flip these.
+    local out
+    out=$(run "$(inserts $(seq 1 15))"$'\n.exit\n')
+    want "$out" "Need to implement searching an internal node" || return 1
+    out=$(run "$(inserts $(seq 1 14))"$'\nselect\n.exit\n')
+    want "$out" "Need to implement scanning a multi-level tree"
 }
 
 t_duplicate_key() {
@@ -113,7 +173,7 @@ t_duplicate_key() {
     [[ $(grep -cF '(1, user1, person1@example.com)' <<<"$out") -eq 1 ]]
 }
 
-ALL=(inserts_and_retrieves table_full max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key)
+ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists multilevel_unimplemented)
 
 run_one() {
     if "t_$1"; then

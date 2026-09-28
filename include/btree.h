@@ -1,15 +1,18 @@
 #ifndef BTREE_H
 #define BTREE_H
 
+#include<stdbool.h>
 #include<stdint.h>
 
+#include "pager.h"
 #include "record.h"
 #include "schema.h"
 
 /*
- * Node kinds in the b-tree. Internal nodes route by key and point at children;
- * leaf nodes hold the actual cells (key + serialized row). Only leaf nodes
- * exist so far — this module gains internal-node support in later parts.
+ * Node kinds in the b-tree. Leaf nodes hold the actual cells (key + serialized
+ * row). Internal nodes hold only routing information: child page numbers
+ * separated by keys, where each key is the largest key found in the child to
+ * its left.
  *
  * The kind is stored in the node's header byte, so a page can describe itself:
  * callers dispatch on get_node_type() rather than assuming what a page holds.
@@ -25,10 +28,16 @@ NodeType get_node_type(void* node);
 /* Stamps the node's kind into its header, as a single byte. */
 void set_node_type(void* node, NodeType type);
 
+/* Whether this node is the root of its tree. */
+bool is_node_root(void* node);
+
+/* Marks or unmarks the node as the root of its tree. */
+void set_node_root(void* node, bool is_root);
+
 /*
- * Every node occupies exactly one page. A leaf node's cell size depends on the
- * table's row width, so capacity and field addresses are functions of the
- * Schema rather than compile-time constants. The accessors return live
+ * Leaf nodes. Every node occupies exactly one page. A leaf's cell size depends
+ * on the table's row width, so capacity and field addresses are functions of
+ * the Schema rather than compile-time constants. The accessors return live
  * pointers into the page, usable as both getters and setters.
  */
 
@@ -51,20 +60,45 @@ void* leaf_node_value(void* node, uint32_t cell_num, const Schema* schema);
  */
 uint32_t leaf_node_find_cell(void* node, uint32_t key, const Schema* schema);
 
-/* Turns a fresh page into an empty leaf node (typed, cell count = 0). */
+/* Turns a fresh page into an empty, non-root leaf node. */
 void initialize_leaf_node(void* node);
 
 /*
- * Inserts a key/row cell at `cell_num`, shifting later cells right. Exits if
- * the node is already full (splitting is not implemented yet).
+ * Inserts a key/row cell at `cell_num` of the leaf on page `page_num`, shifting
+ * later cells right. A full leaf is split in two instead, and if that leaf was
+ * the root, a new internal root is created above both halves.
  */
-void leaf_node_insert(void* node, uint32_t cell_num, uint32_t key,
+void leaf_node_insert(Pager* pager, uint32_t page_num, uint32_t cell_num, uint32_t key,
                       const Record* value, const Schema* schema);
+
+/*
+ * Internal nodes. The header holds the key count and the rightmost child; the
+ * body is an array of (child page, key) cells. A node with N keys therefore has
+ * N + 1 children, the last of which lives in the header rather than a cell.
+ */
+
+/* Pointer to the internal node's key-count field. */
+uint32_t* internal_node_num_keys(void* node);
+
+/* Pointer to the page number of the rightmost child. */
+uint32_t* internal_node_right_child(void* node);
+
+/*
+ * Pointer to the page number of child `child_num`, valid for
+ * 0 <= child_num <= num_keys. Exits on an out-of-range index.
+ */
+uint32_t* internal_node_child(void* node, uint32_t child_num);
+
+/* Pointer to key `key_num`: the largest key in the child to its left. */
+uint32_t* internal_node_key(void* node, uint32_t key_num);
 
 /* Prints the layout constants (used by the .constants meta command). */
 void print_constants(const Schema* schema);
 
-/* Prints a leaf node's cell count and keys (used by the .btree meta command). */
-void print_leaf_node(void* node, const Schema* schema);
+/*
+ * Prints the subtree rooted at `page_num`, one node per line and indented by
+ * depth (used by the .btree meta command). Works on a tree of any height.
+ */
+void print_tree(Pager* pager, const Schema* schema, uint32_t page_num, uint32_t indentation_level);
 
 #endif

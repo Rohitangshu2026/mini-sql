@@ -84,6 +84,16 @@ void* pager_get_page(Pager* pager, uint32_t page_num){
 }
 
 /*
+ * Until deleted pages are recycled through a free list, every new node simply
+ * goes at the end of the file, so the next unused page is num_pages. The page
+ * isn't claimed until pager_get_page grows num_pages past it — hence the
+ * fetch-before-allocating-again contract documented in the header.
+ */
+uint32_t get_unused_page_num(Pager* pager){
+    return pager->num_pages;
+}
+
+/*
  * Writes one whole page back to its offset in the file. A node always fills a
  * page, so unlike the pre-b-tree version there is no partial-page size to pass.
  * Flushing an unresident page or any I/O failure is fatal.
