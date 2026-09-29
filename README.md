@@ -31,7 +31,7 @@ is in place.
 - [Module dependency graph](#module-dependency-graph)
 - [The data model](#the-data-model)
 - [Row layout](#row-layout)
-- [On-disk node format](#on-disk-node-format)
+- [On-disk format](#on-disk-format)
 - [How the B-tree works](#how-the-b-tree-works)
 - [Command lifecycle](#command-lifecycle)
 - [The REPL state machine](#the-repl-state-machine)
@@ -121,13 +121,13 @@ tests. No third-party libraries.
 | Input validation (syntax, negative id, over-length text) | ✅ |
 | Schema-driven row (de)serialization | ✅ |
 | Persistence to a single database file | ✅ |
+| **Page cache that grows with the file** — no page limit | ✅ |
+| **Versioned file header**: foreign, older or corrupt files are refused, never misread | ✅ |
 | Per-statement execution timing | ✅ |
-| Black-box test suite (20 CTest cases) with a B+ tree invariant checker | ✅ |
-| More than 100 pages | ⛔ the page cache is a fixed array — 699 rows in ascending order |
+| Black-box test suite (22 CTest cases) with a B+ tree invariant checker | ✅ |
 | `WHERE`, `DELETE`, `UPDATE` | ⛔ |
 | `CREATE TABLE` / multiple tables | ⛔ single hardcoded schema |
 | Crash safety (journal / WAL) | ⛔ flush happens only on clean `.exit` |
-| File-format versioning | ⛔ files from before a format change are unreadable |
 
 ---
 
@@ -158,10 +158,11 @@ flowchart TD
         EXEC["executor — insert / select"]
         CUR["cursor — navigate the tree"]
         TABLE["table — db_open / db_close"]
+        HDR["file_header — page 0: format, page size, root"]
         BTREE["btree — node format, search, split"]
         REC["record — row (de)serialization"]
         SCHEMA["schema — column layout"]
-        PAGER["pager — page cache + file"]
+        PAGER["pager — growable page cache + file"]
     end
 
     FILE[("database file")]
@@ -178,7 +179,9 @@ flowchart TD
     EXEC --> BTREE
     CUR --> BTREE
     TABLE --> BTREE
+    TABLE --> HDR
     TABLE --> PAGER
+    HDR --> PAGER
     META --> BTREE
     META --> TABLE
     BTREE --> PAGER
@@ -269,8 +272,10 @@ flowchart BT
     cursor --> table
     cursor --> btree
     table --> btree
+    table --> file_header
     table --> pager
     table --> schema
+    file_header --> pager
     btree --> pager
     btree --> record
     btree --> schema
@@ -288,9 +293,10 @@ flowchart BT
 | `parser` | Recursive descent from tokens to a syntax tree; syntax errors | `parse_statement`, `ast_free` |
 | `schema` | Runtime column layout: types, sizes, **computed offsets**; case-insensitive name lookup | `schema_create`, `schema_find_column_by_id/name`, `schema_names_equal`, `schema_free` |
 | `record` | An opaque row payload + schema-keyed get/set + (de)serialize | `record_init`, `record_set_int/text`, `serialize_record`, `print_record` |
-| `pager` | Page cache backed by a file; allocates, reads on miss, flushes on close | `pager_open`, `pager_get_page`, `get_unused_page_num`, `pager_flush`, `pager_close` |
+| `pager` | Growable page cache backed by a file; allocates zeroed pages, reads on miss, flushes on close | `pager_open`, `pager_get_page`, `get_unused_page_num`, `pager_flush`, `pager_close` |
+| `file_header` | Page 0's layout: writes a new header, validates an existing one, reads the root page | `file_header_initialize`, `file_header_validate`, `file_header_root_page` |
 | `btree` | Leaf and internal node formats, per-node binary search, leaf split and root growth, tree printer | `leaf_node_insert`, `leaf_node_find_cell`, `internal_node_find_child`, `leaf_node_next_leaf`, `print_tree` |
-| `table` | Opens/closes a database connection; creates the root leaf of a new file | `db_open`, `db_close` |
+| `table` | Opens/closes a database connection; writes the header and root of a new file, refuses a file it can't read | `db_open`, `db_close` |
 | `cursor` | A position in a leaf; tree descent and leaf-chain traversal | `table_start`, `table_find`, `cursor_value`, `cursor_advance` |
 | `statement` | The binder: check a syntax tree against the table, build the row; type and name errors | `prepare_statement`, `statement_set_default_table` |
 | `executor` | Run a prepared `Statement` against a `Table` via a cursor | `execute_statement` |
@@ -305,7 +311,8 @@ code actually follows):
 
 - `Schema` **owns** its `ColumnDefinition` array (deep copy, including names).
 - `Table` **owns** a `Pager` and **borrows** a `Schema` (taken at open, freed by
-  `db_close`). A table *is* a B-tree, identified by its root page — always page 0.
+  `db_close`). A table *is* a B-tree, identified by its root page — the page the
+  file header records, page 1 in a new database.
 - `Pager` **owns** the page cache and the open file descriptor.
 - `Cursor` **points into** a leaf of a `Table`; it owns nothing.
 - `Statement` **holds** a `Record` inline; `Record` is just bytes, **interpreted by**
@@ -332,7 +339,8 @@ classDiagram
         +int file_descriptor
         +uint32 file_length
         +uint32 num_pages
-        +pages100 pages
+        +uint32 capacity
+        +pointer pages
     }
     class Table {
         +Schema schema
@@ -395,11 +403,52 @@ cell that stores the row, and the tree is ordered by it.
 
 ---
 
-## On-disk node format
+## On-disk format
 
-The database file is an array of 4 KiB pages, and **every page holds exactly one
-B-tree node**. Page 0 is always the root. Every node starts with the same 8-byte
-header:
+The database file is an array of 4 KiB pages. **Page 0 is the file header**, and
+**every other page holds exactly one B-tree node**:
+
+```text
+page 0   file header
+page 1   root of the users table (in a new database)
+page 2…  every other node, each allocated at the end of the file as it's needed
+```
+
+### The file header
+
+| Bytes | Field |
+| --- | --- |
+| 0–15 | magic `mini-sql format\0`, after SQLite's `SQLite format 3\0` |
+| 16–19 | file format version — `1` |
+| 20–23 | page size — `4096` |
+| 24–27 | page holding the table's root node |
+| 28–4095 | zero, reserved for fields later formats add |
+
+Opening a file checks the header before anything else, and refuses — with a
+message, and without writing a byte — a file that fails:
+
+| Check | Message |
+| --- | --- |
+| length a whole number of pages | `Db file is not a whole number of pages. Corrupt file.` |
+| the magic | `Error: X is not a mini-sql database, or was written by an older build.` |
+| the format version | `Error: X uses file format 2; this build reads format 1.` |
+| the page size | `Error: X uses 8192-byte pages; this build uses 4096.` |
+| the root is a node page | `Error: X is corrupt: its root page 99 is not a node page of the file.` |
+
+Every file written before the header existed has a node where the magic belongs, so
+it's refused by the second check rather than misread. Any change to what a file
+holds bumps the format version, so from here on old files are always refused
+cleanly.
+
+The header gets a whole page to itself. SQLite instead fits a 100-byte header at the
+start of its first page, which also holds a B-tree root; here every node starts at
+byte 0 of its page, and sharing a page would make that depend on the page number in
+every accessor. Fields are stored in the machine's byte order, like every node
+field.
+
+### Nodes
+
+Every node starts with the same 8-byte header:
 
 | Bytes | Field |
 | --- | --- |
@@ -414,7 +463,7 @@ header:
 | --- | --- |
 | 0–7 | common header |
 | 8–11 | `num_cells` |
-| 12–15 | `next_leaf` — page of the right sibling, `0` for the rightmost leaf |
+| 12–15 | `next_leaf` — page of the right sibling, `0` for the rightmost leaf (page 0 is the header, so it can't be a sibling) |
 | 16 + 296·i | cell *i*: 4-byte key, 291-byte row, 1 byte of padding |
 
 **Internal node** — routes lookups:
@@ -459,9 +508,9 @@ keeps routing:
 
 ```mermaid
 flowchart TD
-    R["page 0 · internal root<br/>key 7"]
-    L["page 2 · leaf<br/>keys 1 – 7"]
-    RL["page 1 · leaf<br/>keys 8 – 15"]
+    R["page 1 · internal root<br/>key 7"]
+    L["page 3 · leaf<br/>keys 1 – 7"]
+    RL["page 2 · leaf<br/>keys 8 – 15"]
     R -->|"key ≤ 7"| L
     R -->|"key > 7"| RL
     L -.->|next_leaf| RL
@@ -528,17 +577,19 @@ itself, which haven't been overwritten yet. The new cell's key goes in the key
 slot and its row in the value slot.
 
 **The root never moves.** When the root leaf splits, `create_new_root` copies its
-contents (now the left half) to a freshly allocated page and reinitializes page 0
-as an internal node pointing at both halves, with the left half's maximum as the
-separator. The table's `root_page_num` therefore stays 0 forever, and the copy
-carries the left half's `next_leaf` pointer with it, so the leaf chain comes out
-right without special handling. Both halves record page 0 as their parent.
+contents (now the left half) to a freshly allocated page and reinitializes the root
+page as an internal node pointing at both halves, with the left half's maximum as
+the separator. The root page the header records therefore never changes, and the
+copy carries the left half's `next_leaf` pointer with it, so the leaf chain comes
+out right without special handling. Both halves record the root page as their
+parent.
 
 | | before the 14th insert | after |
 | --- | --- | --- |
-| page 0 | leaf, 13 cells (root) | internal root: key 7 → page 2, else page 1 |
-| page 1 | — | leaf, keys 8–14, `next_leaf = 0` |
-| page 2 | — | leaf, keys 1–7 (copied from page 0), `next_leaf = 1` |
+| page 0 | header | header (unchanged) |
+| page 1 | leaf, 13 cells (root) | internal root: key 7 → page 3, else page 2 |
+| page 2 | — | leaf, keys 8–14, `next_leaf = 0` |
+| page 3 | — | leaf, keys 1–7 (copied from page 1), `next_leaf = 2` |
 
 ### Updating the parent — splitting a leaf below the root
 
@@ -565,11 +616,11 @@ rightmost leaf keeps splitting — and produces a four-leaf tree:
 
 ```mermaid
 flowchart TD
-    R["page 0 · internal root<br/>keys 7 | 14 | 21"]
-    L1["page 2 · leaf<br/>1 – 7"]
-    L2["page 1 · leaf<br/>8 – 14"]
-    L3["page 3 · leaf<br/>15 – 21"]
-    L4["page 4 · leaf<br/>22 – 30"]
+    R["page 1 · internal root<br/>keys 7 | 14 | 21"]
+    L1["page 3 · leaf<br/>1 – 7"]
+    L2["page 2 · leaf<br/>8 – 14"]
+    L3["page 4 · leaf<br/>15 – 21"]
+    L4["page 5 · leaf<br/>22 – 30"]
     R --> L1
     R --> L2
     R --> L3
@@ -610,7 +661,7 @@ makes the root `[7 | 14 | 21]` split when row 35 arrives:
 
 ```mermaid
 flowchart TD
-    R["page 0 · root<br/>key 14"]
+    R["page 1 · root<br/>key 14"]
     I1["internal<br/>key 7"]
     I2["internal<br/>keys 21 | 28"]
     R --> I1
@@ -864,11 +915,17 @@ Lifecycle rules:
 
 - `schema_create` deep-copies the caller's column array and `strdup`s each name, so
   the source array may be a stack literal in `main`.
-- `db_open` opens the file (via `pager_open`), stores a **borrowed** `Schema*`, and
-  for a new file turns page 0 into an empty root leaf.
+- `db_open` opens the file (via `pager_open`) and stores a **borrowed** `Schema*`.
+  For a new file it writes the header on page 0 and an empty root leaf on page 1;
+  for an existing one it validates the header and exits without writing anything
+  if the file isn't one it can read.
 - New nodes get their page from `get_unused_page_num` — the page just past the end
-  of the file — and are cached like any other page. Nothing is reserved until the
-  page is fetched, so callers fetch a page before allocating the next one.
+  of the file — and are cached like any other page, zero-filled. Nothing is
+  reserved until the page is fetched, so callers fetch a page before allocating the
+  next one; a fetch further past the end is refused as a bug.
+- The page cache is an array of page pointers that doubles as the file grows. Only
+  the array moves: each page is its own allocation, so a node pointer the B-tree
+  holds stays valid while it fetches other pages.
 - `db_close` is the single teardown path: it flushes every cached page, then
   `pager_close` (closes the fd + frees the cache), then `schema_free`, then frees the
   table. `.exit` is the only caller.
@@ -900,6 +957,7 @@ flowchart LR
         e[schema.c]
         f[record.c]
         g[table.c]
+        m[file_header.c]
         h[pager.c]
         i[cursor.c]
         j[btree.c]
@@ -948,7 +1006,7 @@ Every case receives both binaries. The internal-split cases drive the 3-key test
 build, and first check through `.constants` that it really got that build; the
 rest drive the real `mini_sql`.
 
-The 20 cases:
+The 22 cases:
 
 | Area | Cases |
 | --- | --- |
@@ -962,7 +1020,9 @@ The 20 cases:
 | Internal splits | the tutorial's published three-level tree, line for line; trees four and five levels deep from 210 rows ascending, descending and scrambled, checked against the B+ tree invariants; a deep tree reopened and split all over again through parent pointers read from disk, then reopened once more |
 | Duplicates | rejected in a single leaf, in either leaf of a split tree, and in a four-leaf tree for keys equal to a separator and just past the last one |
 | Scans | every row in key order across leaves, for four insertion orders and across a reopen, and across four leaves and deep trees; an empty table |
-| Boundary | the page cache: 699 ascending rows make a valid two-level tree, and row 700, which needs a 101st page, stops with the pager's message |
+| Large tables | on the real binary, 3,583 ascending rows fill a 510-key root exactly and row 3,584 splits it — the real fan-out's first internal split — with every row reachable before and after a reopen |
+| File header | a new file's magic, format version, page size and root page; a header that stays byte-identical as the table grows and across a reopen, with its reserved bytes zero; two files built from the same statements, byte-identical |
+| Refused files | a page of zeros, a file from before the header existed, a page of text, and good headers patched to format 2, 8192-byte pages, root page 0 and root page 99 — each refused with its message and a failing exit status, and left byte for byte unchanged |
 
 How the suite earns its trust:
 
@@ -1000,6 +1060,11 @@ How the suite earns its trust:
 - **Front-end mutation checks.** Matching keywords case-sensitively, leaving `''`
   unescaped, ignoring trailing tokens, skipping the binder's type check, lexing `7x`
   as `7`, and cutting the last byte of an unterminated final line each fail a test.
+- **Storage mutation checks.** Capping the page cache at 100 pages again, skipping
+  the version, page-size or root check, and ignoring the header's root page each
+  fail a test. One change can't be caught on macOS: allocating new pages with
+  `malloc` instead of `calloc`, because a fresh 4 KiB allocation there is zeroed
+  anyway. The zeroing is a guarantee for platforms where it isn't.
 - **Sanitizers.** The B-tree stages were each run under AddressSanitizer and
   UndefinedBehaviorSanitizer, which is what surfaced the misaligned loads in the
   tutorial's node layout.
@@ -1041,8 +1106,12 @@ through a pointer is well-defined C on any architecture. Same capacity as the
 packed layout.
 
 **The root never moves.** A root split copies the old root out rather than moving
-the new root in, so the table is identified by page 0 forever and nothing has to be
-updated when the tree grows a level.
+the new root in, so the root page the header records stays right forever and
+nothing has to be updated when the tree grows a level.
+
+**Refuse, never misread.** A file is checked against its header before a single
+page is interpreted, and every format change bumps the version. The worst an old or
+foreign file can get is a clear refusal — never wrong answers, and never a write.
 
 **Invariants by construction, then asserted.** "A cursor always points into a leaf"
 isn't checked in scattered places — the only two ways to create a cursor go through
@@ -1132,9 +1201,9 @@ flowchart LR
     classDef now fill:#fff2cc,stroke:#bba12a;
     classDef todo fill:#eeeeee,stroke:#999999;
 
-    class A,S1 done;
-    class S2 now;
-    class S3,S4,S5,S6 todo;
+    class A,S1,S2 done;
+    class S3 now;
+    class S4,S5,S6 todo;
 ```
 
 - **Done — the tutorial (1–14):** REPL, schema-driven rows, a file-backed pager, the
@@ -1144,13 +1213,15 @@ flowchart LR
 - **Done — Stage 1, SQL front end:** a tokenizer, a recursive-descent parser and a
   binder for `INSERT` and `SELECT *`, with syntax and type errors that say what and
   where.
-- **Next — Stage 2, storage foundation:** a page table that grows instead of stopping
-  at 100 pages, and a versioned header on page 0 that rejects files from older
-  builds cleanly. With the page limit gone, the real binary reaches its first
-  510-key internal split.
-- **Stage 3 — catalog and `CREATE TABLE`:** the catalog is itself a B-tree table
-  holding each table's name, root page and `CREATE TABLE` text, re-parsed on open.
-  Many tables share one file; the hardcoded `users` table goes away.
+- **Done — Stage 2, storage foundation:** a page cache that grows with the file
+  instead of stopping at 100 pages, and a versioned header on page 0 that refuses
+  foreign, older or corrupt files cleanly. With the page limit gone, the real
+  binary reaches its first 510-key internal split at 3,584 ascending rows.
+- **Next — Stage 3, catalog and `CREATE TABLE`:** the catalog is itself a B-tree
+  table holding each table's name, root page and `CREATE TABLE` text, re-parsed on
+  open. The header records the catalog's root instead of a single table's, which
+  makes it file format 2. Many tables share one file; the hardcoded `users` table
+  goes away.
 - **Stage 4 — `SELECT` column lists, typed `WHERE`, range scans:** conditions on the
   primary key become a point lookup or a seek plus a bounded walk along the leaf
   chain, and `EXPLAIN` shows which plan was chosen.
@@ -1175,7 +1246,8 @@ mini-sql/
 │   ├── parser.h            # syntax tree (Ast, Literal), SqlError, parse_statement
 │   ├── schema.h            # ColumnType, ColumnDefinition, Schema
 │   ├── record.h            # Record + (de)serialization
-│   ├── pager.h             # Pager, page cache constants, page allocation
+│   ├── pager.h             # Pager, PAGE_SIZE, the growable page cache, page allocation
+│   ├── file_header.h       # page 0's layout, FILE_FORMAT_VERSION, header checks
 │   ├── btree.h             # node formats, search, insert/split, tree printer
 │   ├── table.h             # Table + db_open / db_close
 │   ├── cursor.h            # Cursor + start/find/value/advance
@@ -1189,6 +1261,7 @@ mini-sql/
 │   ├── schema.c
 │   ├── record.c
 │   ├── pager.c
+│   ├── file_header.c
 │   ├── btree.c
 │   ├── table.c
 │   ├── cursor.c
@@ -1205,18 +1278,16 @@ mini-sql/
 
 This is a learning engine. Known gaps, most of them on the [roadmap](#roadmap):
 
-- **Capacity** — the pager caches at most 100 pages in a fixed array, so the table
-  tops out at 699 rows inserted in ascending order, and at most 1,287 (99 full
-  leaves). The insert that needs a 101st page stops with `Tried to fetch page number
-  out of bounds`. Internal-node splits work, but the real binary never reaches one:
-  a 510-key root isn't full until it has 511 leaves. The 3-key test build exercises
-  them, and holds 384 ascending rows before the same page limit.
+- **Memory** — the page cache never evicts, so every page a session touches stays in
+  memory until `.exit`: 4 KiB per page, which for 100,000 rows inserted in order is
+  a 56 MB file and 58 MB of memory at peak. Close writes every loaded page, changed
+  or not. Files over 4 GiB aren't supported (the
+  file's length is read into 32 bits), though memory runs out well before that.
 - **Crash safety** — pages are flushed only on a clean `.exit`; kill the process, or
-  hit one of the boundaries above, and unsaved changes are lost. No rollback journal
-  or WAL.
-- **File-format stability** — the page layout has changed several times on the way
-  here and isn't versioned, so a database file from an earlier build is unreadable.
-  Delete and recreate it.
+  hit a fatal error, and unsaved changes are lost. No rollback journal or WAL.
+- **Older files** — files written before the header existed are refused (the header
+  is the last format change that couldn't be detected); delete and recreate them.
+  Stage 3 moves to format 2, and format-1 files will be refused the same way.
 - **A small SQL dialect** — so far `INSERT` and `SELECT *` on one hardcoded `users`
   table, one statement per line, INT and TEXT(n) columns only, no NULLs or defaults.
   `WHERE` and `DELETE` are on the roadmap; `UPDATE`, joins and subqueries are not.
