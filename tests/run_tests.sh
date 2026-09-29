@@ -48,7 +48,7 @@ btree_block() {
 inserts() {
     local id
     for id in "$@"; do
-        printf 'insert %s user%s person%s@example.com\n' "$id" "$id" "$id"
+        printf "INSERT INTO users VALUES (%s, 'user%s', 'person%s@example.com');\n" "$id" "$id" "$id"
     done
 }
 
@@ -84,6 +84,28 @@ tree_over_leaves() {
             printf -- '  - key %s\n' "$last"
         fi
     done
+}
+
+# error_lines OUTPUT -> every error message printed, one per line, with the
+# "db > " prompt stripped off
+error_lines() {
+    sed -nE 's/^(db > )+((Syntax error|Type error|Error): .*)$/\2/p' <<<"$1"
+}
+
+# check_error_cases INPUT MESSAGE [INPUT MESSAGE ...] -> runs every INPUT in
+# one session, followed by one valid insert and a select, and succeeds if each
+# INPUT printed exactly its MESSAGE, in order, and none of them changed the
+# table: the select must return the valid row and nothing else.
+check_error_cases() {
+    local inputs=() messages=() out
+    while (( $# >= 2 )); do
+        inputs+=("$1")
+        messages+=("$2")
+        shift 2
+    done
+    out=$(run "$(printf '%s\n' "${inputs[@]}")"$'\n'"$(inserts 1)"$'\nSELECT * FROM users;\n.exit\n')
+    [[ "$(error_lines "$out")" == "$(printf '%s\n' "${messages[@]}")" ]] &&
+    [[ "$(select_rows "$out")" == "$(expected_rows 1)" ]]
 }
 
 # The users table's leaf capacity (pinned by t_constants).
@@ -314,7 +336,7 @@ EOF
 
 t_inserts_and_retrieves() {
     local out
-    out=$(run $'insert 1 user1 person1@example.com\nselect\n.exit\n')
+    out=$(run $'INSERT INTO users VALUES (1, \'user1\', \'person1@example.com\');\nSELECT * FROM users;\n.exit\n')
     want "$out" "db > (1, user1, person1@example.com)"
 }
 
@@ -322,30 +344,35 @@ t_max_length_strings() {
     local u e out
     u=$(printf 'a%.0s' $(seq 1 32))    # 32-char username (the max)
     e=$(printf 'a%.0s' $(seq 1 255))   # 255-char email   (the max)
-    out=$(run "insert 1 $u $e"$'\n'"select"$'\n'".exit"$'\n')
+    out=$(run "INSERT INTO users VALUES (1, '$u', '$e');"$'\nSELECT * FROM users;\n.exit\n')
     want "$out" "(1, $u, $e)"
 }
 
 t_string_too_long() {
+    # One byte over either column's width is a type error naming the column,
+    # and nothing is inserted.
     local u e out
-    u=$(printf 'a%.0s' $(seq 1 33))    # one over the limit
-    e=$(printf 'a%.0s' $(seq 1 256))
-    out=$(run "insert 1 $u $e"$'\n'"select"$'\n'".exit"$'\n')
-    want "$out" "String is too long."
+    u=$(printf 'a%.0s' $(seq 1 33))    # one over the username limit
+    e=$(printf 'a%.0s' $(seq 1 256))   # one over the email limit
+    out=$(run "INSERT INTO users VALUES (1, '$u', 'x');"$'\n'"INSERT INTO users VALUES (1, 'x', '$e');"$'\nSELECT * FROM users;\n.exit\n')
+    want "$out" "Type error: column 'username' is TEXT(32), but the value is 33 bytes." &&
+    want "$out" "Type error: column 'email' is TEXT(255), but the value is 256 bytes." &&
+    [[ -z "$(select_rows "$out")" ]]
 }
 
 t_negative_id() {
     local out
-    out=$(run $'insert -1 cstack foo@bar.com\nselect\n.exit\n')
-    want "$out" "ID must be positive."
+    out=$(run $'INSERT INTO users VALUES (-1, \'cstack\', \'foo@bar.com\');\nSELECT * FROM users;\n.exit\n')
+    want "$out" "Error: column 'id' must not be negative." &&
+    [[ -z "$(select_rows "$out")" ]]
 }
 
 t_persistence() {
     # Insert then exit (flushes to disk), reopen the SAME file, and read it back.
     rm -f "$TESTDB"
-    printf 'insert 1 user1 person1@example.com\n.exit\n' | "$DB" "$TESTDB" >/dev/null
+    { inserts 1; printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
     local out
-    out=$(printf 'select\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    out=$(printf 'SELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
     want "$out" "(1, user1, person1@example.com)"
 }
 
@@ -446,14 +473,14 @@ t_select_multilevel() {
     # or value would show up here as a row whose id and name disagree.
     local order out
     for order in "$(seq 1 14)" "$(seq 14 -1 1)" "$(seq 1 6) $(seq 8 14) 7" "$(seq 1 7) $(seq 9 14) 8"; do
-        out=$(run "$(inserts $order 15)"$'\nselect\n.exit\n')
+        out=$(run "$(inserts $order 15)"$'\nSELECT * FROM users;\n.exit\n')
         [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 15))" ]] || return 1
     done
 
     # 20 rows fill the right leaf completely; the chain must survive a reopen.
     rm -f "$TESTDB"
     { inserts $(seq 1 20); printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
-    out=$(printf 'select\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    out=$(printf 'SELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
     [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 20))" ]]
 }
 
@@ -461,7 +488,7 @@ t_select_empty() {
     # A scan of an empty table starts by searching the empty root leaf for
     # key 0; that must mean "nothing to scan", not a phantom row.
     local out
-    out=$(run $'select\n.exit\n')
+    out=$(run $'SELECT * FROM users;\n.exit\n')
     [[ -z "$(select_rows "$out")" ]] && want "$out" "Executed."
 }
 
@@ -483,7 +510,7 @@ t_btree_nonroot_split() {
     local leaves=("1-7 8-14 15-21 22-30" "1-9 10-16 17-23 24-30" "1-7 8-15 16-22 23-30")
     local i out
     for i in 0 1 2; do
-        out=$(run "$(inserts ${orders[i]})"$'\n.btree\nselect\n.exit\n')
+        out=$(run "$(inserts ${orders[i]})"$'\n.btree\nSELECT * FROM users;\n.exit\n')
         [[ "$(btree_block "$out")" == "$(tree_over_leaves ${leaves[i]})" ]] || return 1
         [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 30))" ]] || return 1
     done
@@ -494,7 +521,7 @@ t_btree_nonroot_split() {
     # tree and every row must then survive a reopen, all five pages intact.
     out=$(run "$(inserts $(seq 1 30) 14 21 22)"$'\n.exit\n')
     [[ $(grep -cF 'Error: Duplicate key.' <<<"$out") -eq 3 ]] || return 1
-    out=$(printf '.btree\nselect\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    out=$(printf '.btree\nSELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
     [[ "$(btree_block "$out")" == "$(tree_over_leaves 1-7 8-14 15-21 22-30)" ]] &&
     [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 30))" ]]
 }
@@ -511,7 +538,7 @@ t_btree_internal_split() {
     # set), and a select must return every row in key order.
     local DB="$SMALL_FANOUT_DB" order out height
     require_small_fanout || return 1
-    out=$(run "$(inserts $CSTACK_7_LEAF_ORDER)"$'\n.btree\nselect\n.exit\n')
+    out=$(run "$(inserts $CSTACK_7_LEAF_ORDER)"$'\n.btree\nSELECT * FROM users;\n.exit\n')
     [[ "$(btree_block "$out")" == "$CSTACK_7_LEAF_TREE" ]] || return 1
     [[ "$(select_rows "$out")" == "$(expected_rows $(printf '%s\n' $CSTACK_7_LEAF_ORDER | sort -n))" ]] || return 1
 
@@ -528,7 +555,7 @@ t_btree_internal_split() {
     # subtree. A scan still finds every row through the leaf chain; only the
     # separator check in btree_check sees the damage.
     for order in "$(seq 1 210)" "$(seq 210 -1 1)" "$(scrambled 211)"; do
-        out=$(run "$(inserts $order)"$'\n.btree\nselect\n.exit\n')
+        out=$(run "$(inserts $order)"$'\n.btree\nSELECT * FROM users;\n.exit\n')
         height=$(btree_check "$out" 3) && (( height >= 4 )) || return 1
         [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 210))" ]] || return 1
     done
@@ -547,11 +574,11 @@ t_btree_internal_split_persists() {
     out=$(printf '.btree\n.exit\n' | "$DB" "$TESTDB" | normalize)
     height=$(btree_check "$out" 3) && (( height >= 4 )) || return 1
 
-    out=$({ inserts $(seq 199 -2 1); printf '.btree\nselect\n.exit\n'; } | "$DB" "$TESTDB" | normalize)
+    out=$({ inserts $(seq 199 -2 1); printf '.btree\nSELECT * FROM users;\n.exit\n'; } | "$DB" "$TESTDB" | normalize)
     btree_check "$out" 3 >/dev/null || return 1
     [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 200))" ]] || return 1
 
-    out=$(printf '.btree\nselect\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    out=$(printf '.btree\nSELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
     btree_check "$out" 3 >/dev/null &&
     [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 200))" ]]
 }
@@ -562,7 +589,7 @@ t_page_cache_full() {
     # separators — a valid tree with every row reachable — and row 700 needs a
     # 101st page, so it must stop right after row 699 succeeds.
     local out height
-    out=$(run "$(inserts $(seq 1 699))"$'\n.btree\nselect\n.exit\n')
+    out=$(run "$(inserts $(seq 1 699))"$'\n.btree\nSELECT * FROM users;\n.exit\n')
     height=$(btree_check "$out" 510) && (( height == 2 )) || return 1
     want "$out" "- internal (size 98)" || return 1
     [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 699))" ]] || return 1
@@ -571,15 +598,152 @@ t_page_cache_full() {
     [[ "$(tail -n 2 <<<"$out")" == $'db > Executed.\ndb > Tried to fetch page number out of bounds. 100 >= 100' ]]
 }
 
+t_sql_syntax_errors() {
+    # Each malformed line gets exactly one syntax error, saying what the parser
+    # expected and where, or what's wrong with a malformed token — and changes
+    # nothing. The cases include the tutorial's old syntax, inputs the old
+    # line-splitting parser accepted (insertfoo, a trailing WHERE), clauses
+    # that aren't supported yet, a reserved word used as a name, and a long
+    # token that the message cuts short.
+    local long
+    long=$(printf 'x%.0s' $(seq 1 40))
+    check_error_cases \
+        "SELECT * FORM users" \
+        "Syntax error: expected FROM near 'FORM' at column 10." \
+        "SELECT * FROM" \
+        "Syntax error: expected a table name at end of statement." \
+        "INSERT INTO users VALUES (1, 'bob)" \
+        "Syntax error: unterminated string starting at column 30." \
+        "INSERT INTO users VALUES (7x, 'a', 'b')" \
+        "Syntax error: malformed number '7x' at column 27." \
+        "SELECT * FROM users @" \
+        "Syntax error: unrecognized character '@' at column 21." \
+        "UPDATE users SET id = 1" \
+        "Syntax error: expected INSERT or SELECT near 'UPDATE' at column 1." \
+        "insert abc bob bob@x.com" \
+        "Syntax error: expected INTO near 'abc' at column 8." \
+        "insertfoo 3 dave d@x.com" \
+        "Syntax error: expected INSERT or SELECT near 'insertfoo' at column 1." \
+        "SELECT * FROM users junk" \
+        "Syntax error: expected end of statement near 'junk' at column 21." \
+        "select * from nowhere where junk" \
+        "Syntax error: expected end of statement near 'where' at column 23." \
+        "SELECT id FROM users" \
+        "Syntax error: expected '*' near 'id' at column 8." \
+        "INSERT INTO users VALUES (1, 'a', 'b'" \
+        "Syntax error: expected ',' or ')' at end of statement." \
+        "INSERT INTO users VALUES ()" \
+        "Syntax error: expected a value near ')' at column 27." \
+        "INSERT INTO users (id, username, email VALUES (1, 'a', 'b')" \
+        "Syntax error: expected ',' or ')' near 'VALUES' at column 40." \
+        "INSERT INTO users VALUES (-'a', 'b', 'c')" \
+        "Syntax error: expected an integer near ''a'' at column 28." \
+        "INSERT INTO table VALUES (1, 'a', 'b')" \
+        "Syntax error: expected a table name near 'table' at column 13." \
+        "INSERT INTO users VALUES (1, 'a', 'b');;" \
+        "Syntax error: expected end of statement near ';' at column 40." \
+        "SELECT * FROM users $long" \
+        "Syntax error: expected end of statement near '$(printf 'x%.0s' $(seq 1 32))...' at column 21."
+}
+
+t_sql_binding_errors() {
+    # A statement that parses but doesn't fit the table gets exactly one error:
+    # "Error:" for a name or shape that's wrong, "Type error:" for a value the
+    # column can't hold. Checks run from the statement's shape down to single
+    # values, and nothing reaches the table.
+    local long
+    long=$(printf 'x%.0s' $(seq 1 40))
+    check_error_cases \
+        "INSERT INTO orders VALUES (1, 'a', 'b')" \
+        "Error: no such table: orders." \
+        "SELECT * FROM orders" \
+        "Error: no such table: orders." \
+        "INSERT INTO users (id, nick, email) VALUES (1, 'a', 'b')" \
+        "Error: no such column: nick." \
+        "INSERT INTO users (id, ID, email) VALUES (1, 2, 'b')" \
+        "Error: column 'id' is listed twice." \
+        "INSERT INTO users (id, email) VALUES (1, 'a@b')" \
+        "Error: column 'username' has no value." \
+        "INSERT INTO users VALUES (1, 'bob')" \
+        "Error: 2 values for 3 columns." \
+        "INSERT INTO users (id, email) VALUES (1, 'a', 'b')" \
+        "Error: 3 values for 2 columns." \
+        "INSERT INTO users VALUES ('abc', 'b', 'c')" \
+        "Type error: column 'id' is INT, but 'abc' is text." \
+        "INSERT INTO users VALUES ('$long', 'b', 'c')" \
+        "Type error: column 'id' is INT, but '$(printf 'x%.0s' $(seq 1 32))...' is text." \
+        "INSERT INTO users VALUES (1, 42, 'c')" \
+        "Type error: column 'username' is TEXT, but 42 is an integer." \
+        "INSERT INTO users VALUES (2147483648, 'b', 'c')" \
+        "Type error: 2147483648 is out of range for INT column 'id'." \
+        "INSERT INTO users VALUES (-2147483649, 'b', 'c')" \
+        "Type error: -2147483649 is out of range for INT column 'id'." \
+        "INSERT INTO users VALUES (99999999999999999999999, 'b', 'c')" \
+        "Type error: 99999999999999999999999 is out of range for INT column 'id'." \
+        "INSERT INTO users VALUES (-5, 'b', 'c')" \
+        "Error: column 'id' must not be negative." || return 1
+
+    # The edges of INT that are allowed: the largest int32, and -0, which is 0.
+    local out
+    out=$(run $'INSERT INTO users VALUES (2147483647, \'max\', \'m@x.com\');\nINSERT INTO users VALUES (-0, \'zero\', \'z@x.com\');\nSELECT * FROM users;\n.exit\n')
+    [[ -z "$(error_lines "$out")" ]] &&
+    [[ "$(select_rows "$out")" == $'(0, zero, z@x.com)\n(2147483647, max, m@x.com)' ]]
+}
+
+t_sql_lexical() {
+    # What the tokenizer and parser must accept: keywords and names in any
+    # case, a column list in any order, doubled quotes inside strings, text
+    # holding spaces, commas, semicolons and a comment marker, tabs and extra
+    # whitespace, an optional semicolon, an empty string, and comments. Blank
+    # lines, comment-only lines and a lone ';' must print nothing at all.
+    # read -d '' rather than $(cat <<EOF): bash 3.2, the macOS default,
+    # misparses quotes inside a heredoc that sits within $(...). IFS= keeps the
+    # script's leading blank line.
+    local script expected out
+    IFS= read -r -d '' script <<'EOF'
+
+-- a line that is only a comment
+;
+insert into USERS values (1, 'lower', 'l@x.com')
+InSeRt InTo UsErS (EMAIL, Id, USERNAME) VaLuEs ('o''brien@x.com', 2, 'Mary Ann')
+INSERT INTO users VALUES (3, 'a, b; c -- not a comment', 'x@x.com');
+INSERT	INTO	users	VALUES	(4,'tabs','t@x.com')
+   INSERT INTO users VALUES ( 5 , 'spaced' , 's@x.com' ) ;   -- trailing comment
+INSERT INTO users VALUES (6, '', 'empty@x.com');
+sElEcT * fRoM users
+.exit
+EOF
+    read -r -d '' expected <<'EOF'
+(1, lower, l@x.com)
+(2, Mary Ann, o'brien@x.com)
+(3, a, b; c -- not a comment, x@x.com)
+(4, tabs, t@x.com)
+(5, spaced, s@x.com)
+(6, , empty@x.com)
+EOF
+    out=$(run "$script")
+    [[ -z "$(error_lines "$out")" ]] || return 1
+    # the blank line, the comment line and the lone ';' each got a prompt and
+    # nothing else, so the first insert's result shares their line
+    [[ "$(head -n 1 <<<"$out")" == "db > db > db > db > Executed." ]] || return 1
+    [[ $(grep -c 'Executed\.' <<<"$out") -eq 7 ]] || return 1
+    [[ "$(select_rows "$out")" == "$expected" ]] || return 1
+
+    # The last line of input may lack a newline; it must be read whole, not
+    # lose its final character (which would ask for a table named "user").
+    out=$(run "$(inserts 1)"$'\nSELECT * FROM users')
+    [[ "$(select_rows "$out")" == "$(expected_rows 1)" ]]
+}
+
 t_duplicate_key() {
     # The second insert of id 1 must be rejected, leaving exactly one row.
     local out
-    out=$(run $'insert 1 user1 person1@example.com\ninsert 1 user1 person1@example.com\nselect\n.exit\n')
+    out=$(run "$(inserts 1 1)"$'\nSELECT * FROM users;\n.exit\n')
     want "$out" "Error: Duplicate key." &&
     [[ $(grep -cF '(1, user1, person1@example.com)' <<<"$out") -eq 1 ]]
 }
 
-ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split select_multilevel select_empty btree_nonroot_split btree_internal_split btree_internal_split_persists page_cache_full)
+ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split select_multilevel select_empty btree_nonroot_split btree_internal_split btree_internal_split_persists page_cache_full sql_syntax_errors sql_binding_errors sql_lexical)
 
 run_one() {
     if "t_$1"; then

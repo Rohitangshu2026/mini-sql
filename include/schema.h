@@ -1,6 +1,7 @@
 #ifndef SCHEMA_H
 #define SCHEMA_H
 
+#include<stdbool.h>
 #include<stdint.h>
 
 /*
@@ -58,8 +59,15 @@ void schema_free(Schema* schema);
 const ColumnDefinition* schema_find_column_by_id(const Schema* schema, uint32_t column_id);
 
 /*
- * Finds a column by exact name. Returns a pointer into the schema's own array
- * (do not free) or NULL if there is no such column.
+ * Whether two table or column names are the same name. SQL names ignore case,
+ * so this compares ASCII letters case-insensitively and every other byte
+ * exactly.
+ */
+bool schema_names_equal(const char* a, const char* b);
+
+/*
+ * Finds a column by name, ignoring case. Returns a pointer into the schema's
+ * own array (do not free) or NULL if there is no such column.
  */
 const ColumnDefinition* schema_find_column_by_name(const Schema* schema, const char* name);
 

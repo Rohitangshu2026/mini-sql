@@ -17,8 +17,10 @@ InputBuffer* new_input_buffer(void){
 
 /*
  * Reads a line into the buffer (getline grows it as needed) and drops the
- * trailing newline by overwriting it with a NUL. Treats EOF or error as fatal,
- * so the REPL loop never has to check for a short read.
+ * trailing newline by overwriting it with a NUL. The last line of piped input
+ * may have no newline, and then there's nothing to drop — cutting the final
+ * byte regardless would turn `users` into `user`. Treats EOF or error as
+ * fatal, so the REPL loop never has to check for a short read.
  */
 void read_input(InputBuffer* input_buffer){
     ssize_t bytes_read = getline(&(input_buffer->buffer), &(input_buffer->buffer_length), stdin);
@@ -27,9 +29,11 @@ void read_input(InputBuffer* input_buffer){
         exit(EXIT_FAILURE);
     }
 
-    /* strip the trailing newline getline leaves in place */
-    input_buffer->input_length = bytes_read - 1;
-    input_buffer->buffer[bytes_read - 1] = 0;
+    input_buffer->input_length = bytes_read;
+    if(input_buffer->buffer[bytes_read - 1] == '\n'){
+        input_buffer->input_length = bytes_read - 1;
+        input_buffer->buffer[bytes_read - 1] = 0;
+    }
 }
 
 /* Frees the getline-owned line storage, then the struct. */

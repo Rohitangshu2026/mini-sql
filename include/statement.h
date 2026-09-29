@@ -1,7 +1,7 @@
 #ifndef STATEMENT_H
 #define STATEMENT_H
 
-#include "input_buffer.h"
+#include "parser.h"
 #include "record.h"
 
 /* The kinds of statement the engine recognizes. */
@@ -19,27 +19,26 @@ typedef struct{
     Record record_to_insert;
 }Statement;
 
-/* Outcome of parsing a line of input into a Statement. */
+/* Outcome of turning a line of SQL into a Statement. */
 typedef enum{
-    PREPARE_SUCCESS,
-    PREPARE_SYNTAX_ERROR,          /* wrong number of fields */
-    PREPARE_NEGATIVE_ID,           /* an integer column got a negative value */
-    PREPARE_STRING_TOO_LONG,       /* a text value exceeds its column width */
-    PREPARE_UNRECOGNIZED_STATEMENT /* not an insert/select */
+    PREPARE_SUCCESS,    /* the statement is ready to execute */
+    PREPARE_EMPTY,      /* a blank line or a lone ';': nothing to run */
+    PREPARE_ERROR       /* a syntax, type or other error, described in the SqlError */
 }PrepareResult;
 
 /*
- * Registers the schema the parser validates inserts against. A temporary stand
- * -in for a catalog: with one hardcoded table the parser has nowhere else to
- * learn the row shape from.
+ * Registers the one table statements can name, and its schema. A stand-in for
+ * a catalog: with a single hardcoded table the binder has nowhere else to look
+ * a name up. `name` is borrowed and must outlive every prepare_statement call.
  */
-void statement_set_default_schema(Schema* schema);
+void statement_set_default_table(const char* name, Schema* schema);
 
 /*
- * Parses one line into `statement`. On a successful insert it also builds the
- * row into statement->record_to_insert. Returns a PrepareResult describing the
- * outcome.
+ * Parses one line of SQL and checks it against the table it names, filling in
+ * `statement` on success — including the row for an insert. On PREPARE_ERROR
+ * the message in `error` is ready to print, and `statement` holds nothing that
+ * needs freeing.
  */
-PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement);
+PrepareResult prepare_statement(const char* sql, Statement* statement, SqlError* error);
 
 #endif

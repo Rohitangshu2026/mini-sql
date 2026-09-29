@@ -19,8 +19,9 @@ typedef struct{
 InputBuffer* new_input_buffer(void);
 
 /*
- * Reads one line from stdin into the buffer, stripping the trailing newline.
- * Exits the process on EOF or read error, so callers never see a failure.
+ * Reads one line from stdin into the buffer, stripping the trailing newline if
+ * there is one (the last line of piped input may not have one). Exits the
+ * process on EOF or read error, so callers never see a failure.
  */
 void read_input(InputBuffer* input_buffer);
 

@@ -73,12 +73,30 @@ const ColumnDefinition* schema_find_column_by_id(const Schema* schema, uint32_t 
 }
 
 /*
- * Linear scan for an exact name match. Returns a borrowed pointer or NULL. The
- * parser uses this to learn a column's width before validating input against it.
+ * Compares two table or column names the way SQL does: ignoring the case of
+ * ASCII letters, so `Users`, `users` and `USERS` all name the same table.
+ * Other bytes must match exactly. Written out rather than using strcasecmp,
+ * which is POSIX rather than C11 and depends on the locale.
+ */
+bool schema_names_equal(const char* a, const char* b){
+    for(;; ++a, ++b){
+        char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a - 'A' + 'a') : *a;
+        char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b - 'A' + 'a') : *b;
+        if(ca != cb)
+            return false;
+        if(ca == '\0')
+            return true;
+    }
+}
+
+/*
+ * Linear scan for a column by name, compared with schema_names_equal so the
+ * lookup ignores case. Returns a borrowed pointer or NULL. The binder uses it
+ * to resolve the column names an INSERT lists.
  */
 const ColumnDefinition* schema_find_column_by_name(const Schema* schema, const char* name){
     for(uint32_t i = 0; i < schema->num_columns; ++i){
-        if(strcmp(schema->columns[i].name, name) == 0){
+        if(schema_names_equal(schema->columns[i].name, name)){
             return &schema->columns[i];
         }
     }

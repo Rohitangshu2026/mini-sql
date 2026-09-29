@@ -20,11 +20,13 @@ static void print_prompt(void){
  * Entry point and REPL loop.
  *
  * Requires the database filename as argv[1]. Builds the hardcoded "users"
- * schema, opens the database against it, and tells the parser which schema to
- * validate inserts with. Then it loops: read a line, route "." lines to the
- * meta-command handler, otherwise prepare and execute a statement, timing
- * execution and reporting the outcome. The loop only ends via ".exit", which
- * exits from inside do_meta_command, so control never falls off the end here.
+ * schema, opens the database against it, and registers the table under its
+ * name so statements can refer to it. Then it loops: read a line, route "."
+ * lines to the meta-command handler, otherwise prepare and execute a
+ * statement, timing execution and reporting the outcome. A statement that
+ * fails to prepare prints its error message, and a blank line prints nothing.
+ * The loop only ends via ".exit", which exits from inside do_meta_command, so
+ * control never falls off the end here.
  */
 int main(int argc, char* argv[]){
     if(argc < 2){
@@ -41,7 +43,7 @@ int main(int argc, char* argv[]){
     uint32_t num_columns = sizeof(users_columns) / sizeof(users_columns[0]);
     Schema* schema = schema_create(users_columns, num_columns);
     Table* table = db_open(argv[1], schema);
-    statement_set_default_schema(schema);
+    statement_set_default_table("users", schema);
 
     InputBuffer* input_buffer = new_input_buffer();
     while(true){
@@ -59,20 +61,14 @@ int main(int argc, char* argv[]){
         }
 
         Statement statement = {0};
-        switch(prepare_statement(input_buffer, &statement)){
+        SqlError error;
+        switch(prepare_statement(input_buffer->buffer, &statement, &error)){
             case PREPARE_SUCCESS:
                 break;
-            case PREPARE_NEGATIVE_ID:
-                printf("ID must be positive.\n");
+            case PREPARE_EMPTY:
                 continue;
-            case PREPARE_STRING_TOO_LONG:
-                printf("String is too long.\n");
-                continue;
-            case PREPARE_SYNTAX_ERROR:
-                printf("Syntax error. Could not parse statement.\n");
-                continue;
-            case PREPARE_UNRECOGNIZED_STATEMENT:
-                printf("Unrecognized keyword at start of '%s'.\n", input_buffer->buffer);
+            case PREPARE_ERROR:
+                printf("%s\n", error.message);
                 continue;
         }
 

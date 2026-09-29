@@ -15,6 +15,8 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 set(MINI_SQL_SOURCES
     src/input_buffer.c
     src/meta_command.c
+    src/tokenizer.c
+    src/parser.c
     src/statement.c
     src/executor.c
     src/schema.c
@@ -67,6 +69,9 @@ set(MINI_SQL_TESTS
     btree_internal_split
     btree_internal_split_persists
     page_cache_full
+    sql_syntax_errors
+    sql_binding_errors
+    sql_lexical
 )
 foreach(t ${MINI_SQL_TESTS})
     add_test(
