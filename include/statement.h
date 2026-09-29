@@ -1,8 +1,12 @@
 #ifndef STATEMENT_H
 #define STATEMENT_H
 
+#include<stdbool.h>
+
 #include "database.h"
+#include "expression.h"
 #include "parser.h"
+#include "planner.h"
 #include "record.h"
 #include "table.h"
 #include "table_definition.h"
@@ -16,15 +20,21 @@ typedef enum{
 
 /*
  * A prepared statement: its kind, the table it acts on (INSERT and SELECT),
- * the row to insert (INSERT), and the checked definition of a new table
- * (CREATE TABLE). Fields a kind doesn't use stay zeroed, so statement_free is
- * always safe.
+ * the row to insert (INSERT), the checked definition of a new table (CREATE
+ * TABLE), and for a SELECT the columns to print, the bound WHERE, the plan
+ * for reading the table and whether it's only to be explained. Fields a kind
+ * doesn't use stay zeroed, so statement_free is always safe.
  */
 typedef struct{
     StatementType type;
     Table* table;                 /* borrowed from the database */
     Record record_to_insert;
     TableDefinition definition;   /* owned until the table is created */
+    uint32_t* column_ids;         /* SELECT: heap-owned, the columns to print in order */
+    uint32_t num_columns;
+    BoundExpr* where;             /* SELECT: heap-owned; NULL without a WHERE */
+    Plan plan;                    /* SELECT: how the table will be read */
+    bool explain;                 /* SELECT: print the plan instead of running it */
 }Statement;
 
 /* Outcome of turning a line of SQL into a Statement. */
@@ -44,8 +54,9 @@ typedef enum{
 PrepareResult prepare_statement(Database* db, const char* sql, Statement* statement, SqlError* error);
 
 /*
- * Frees whatever a statement still owns: the row built for an insert, and a
- * table definition that was never executed. Safe on any prepared statement.
+ * Frees whatever a statement still owns: the row built for an insert, a table
+ * definition that was never executed, and a select's column list and WHERE.
+ * Safe on any prepared statement.
  */
 void statement_free(Statement* statement);
 

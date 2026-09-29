@@ -17,6 +17,8 @@ set(MINI_SQL_SOURCES
     src/meta_command.c
     src/tokenizer.c
     src/parser.c
+    src/expression.c
+    src/planner.c
     src/statement.c
     src/executor.c
     src/schema.c
@@ -82,6 +84,10 @@ set(MINI_SQL_TESTS
     create_table_errors
     many_tables
     catalog_corrupt
+    select_columns
+    where_filters
+    where_errors
+    explain_and_ranges
 )
 foreach(t ${MINI_SQL_TESTS})
     add_test(

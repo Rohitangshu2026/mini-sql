@@ -126,6 +126,22 @@ check_error_cases() {
     [[ "$(select_rows "$out")" == "$(expected_rows 1)" ]]
 }
 
+# query SQL -> the normalized output of one statement run against $TESTDB as
+# it stands, followed by .stats
+query() {
+    printf '%s\n.stats\n.exit\n' "$1" | "$DB" "$TESTDB" | normalize
+}
+
+# rows_examined OUTPUT -> the count .stats printed
+rows_examined() {
+    sed -nE 's/^(db > )?Rows examined: ([0-9]+)$/\2/p' <<<"$1"
+}
+
+# plan_line OUTPUT -> the plan EXPLAIN printed
+plan_line() {
+    sed -nE 's/^(db > )?((SCAN|SEARCH) .*)$/\2/p' <<<"$1"
+}
+
 # The users table's leaf capacity (pinned by t_constants).
 LEAF_MAX_CELLS=13
 
@@ -731,8 +747,8 @@ t_sql_syntax_errors() {
     # Each malformed line gets exactly one syntax error, saying what the parser
     # expected and where, or what's wrong with a malformed token — and changes
     # nothing. The cases include the tutorial's old syntax, inputs the old
-    # line-splitting parser accepted (insertfoo, a trailing WHERE), clauses
-    # that aren't supported yet, a reserved word used as a name, and a long
+    # line-splitting parser accepted (insertfoo, a WHERE with no comparison),
+    # '*' mixed with a column list, a reserved word used as a name, and a long
     # token that the message cuts short.
     local long
     long=$(printf 'x%.0s' $(seq 1 40))
@@ -756,9 +772,9 @@ t_sql_syntax_errors() {
         "SELECT * FROM users junk" \
         "Syntax error: expected end of statement near 'junk' at column 21." \
         "select * from nowhere where junk" \
-        "Syntax error: expected end of statement near 'where' at column 23." \
-        "SELECT id FROM users" \
-        "Syntax error: expected '*' near 'id' at column 8." \
+        "Syntax error: expected a comparison operator at end of statement." \
+        "SELECT *, id FROM users" \
+        "Syntax error: expected FROM near ',' at column 9." \
         "INSERT INTO users VALUES (1, 'a', 'b'" \
         "Syntax error: expected ',' or ')' at end of statement." \
         "INSERT INTO users VALUES ()" \
@@ -1070,6 +1086,236 @@ t_catalog_corrupt() {
     return "$refused"
 }
 
+t_select_columns() {
+    # A column list prints just those columns, in the order listed and with
+    # repeats, for a table whose key isn't its first column; names match
+    # ignoring case; '*' prints every column in table order. A name that
+    # isn't a column is an error, wherever it sits in the list.
+    local script expected
+    IFS= read -r -d '' script <<'EOF'
+CREATE TABLE orders (total INT, id INT PRIMARY KEY, note TEXT(10));
+INSERT INTO orders VALUES (-5, 7, 'late');
+INSERT INTO orders VALUES (12, 3, 'early');
+SELECT note, id FROM orders;
+SELECT id, id, total FROM orders;
+SELECT * FROM orders;
+SELECT ID, Note FROM ORDERS;
+SELECT nick FROM orders;
+SELECT id, nick FROM orders;
+.exit
+EOF
+    read -r -d '' expected <<'EOF'
+db > Executed.
+db > Executed.
+db > Executed.
+db > (early, 3)
+(late, 7)
+Executed.
+db > (3, 3, 12)
+(7, 7, -5)
+Executed.
+db > (12, 3, early)
+(-5, 7, late)
+Executed.
+db > (3, early)
+(7, late)
+Executed.
+db > Error: no such column: nick.
+db > Error: no such column: nick.
+db >
+EOF
+    [[ "$(run_empty "$script")" == "$expected" ]]
+}
+
+t_where_filters() {
+    # WHERE keeps exactly the rows its condition holds for. Each query's rows
+    # are compared with the same condition applied to the same data by awk,
+    # comparing strings byte by byte (LC_ALL=C) as the engine does. The table
+    # has negative values outside the key and a column to compare the key
+    # with; the cases cover every operator on INT and TEXT, <> as !=, NOT
+    # binding tighter than AND and AND tighter than OR, parentheses, column
+    # against column, constant conditions, a literal wider than its column,
+    # case-sensitive text, and key ranges alongside other conditions.
+    local data id sql cond out expected i
+    data=$(for id in $(seq 1 60); do echo "$id $(( id % 7 - 3 )) n$id $(( 61 - id ))"; done)
+    rm -f "$TESTDB"
+    {
+        echo "CREATE TABLE t (id INT PRIMARY KEY, grp INT, name TEXT(10), other INT);"
+        while read -r id grp name other; do
+            echo "INSERT INTO t VALUES ($id, $grp, '$name', $other);"
+        done <<<"$data"
+        echo ".exit"
+    } | "$DB" "$TESTDB" >/dev/null
+
+    local cases=(
+        "grp = 0"                                  '$2 == 0'
+        "grp != 0"                                 '$2 != 0'
+        "grp <> 0"                                 '$2 != 0'
+        "grp < -1"                                 '$2 < -1'
+        "grp <= -1"                                '$2 <= -1'
+        "grp > 2"                                  '$2 > 2'
+        "grp >= 2"                                 '$2 >= 2'
+        "name = 'n7'"                              '$3 == "n7"'
+        "name < 'n2'"                              '$3 < "n2"'
+        "name >= 'n55'"                            '$3 >= "n55"'
+        "name = 'N7'"                              '0'
+        "name < 'n1xxxxxxxxxxxxxxxxxxxx'"          '$3 < "n1xxxxxxxxxxxxxxxxxxxx"'
+        "grp = 0 OR grp = 1 AND id > 30"           '$2 == 0 || ($2 == 1 && $1 > 30)'
+        "(grp = 0 OR grp = 1) AND id > 30"         '($2 == 0 || $2 == 1) && $1 > 30'
+        "NOT grp = 0 AND id < 10"                  '!($2 == 0) && $1 < 10'
+        "NOT (grp = 0 AND id < 10)"                '!($2 == 0 && $1 < 10)'
+        "id < other"                               '$1 < $4'
+        "grp = other"                              '$2 == $4'
+        "1 = 1"                                    '1'
+        "'a' > 'b'"                                '0'
+        "id > 50 AND name != 'n55'"                '$1 > 50 && $3 != "n55"'
+        "5 < id AND 10 >= id"                      '$1 > 5 && $1 <= 10'
+        "id = 8 AND grp = -2"                      '$1 == 8 && $2 == -2'
+        "id >= 20 AND id <= 40 AND (grp < 0 OR name = 'n33')"  '$1 >= 20 && $1 <= 40 && ($2 < 0 || $3 == "n33")'
+    )
+    for (( i = 0; i < ${#cases[@]}; i += 2 )); do
+        sql="SELECT * FROM t WHERE ${cases[i]};"
+        cond=${cases[i + 1]}
+        out=$(query "$sql")
+        expected=$(LC_ALL=C awk "$cond { printf \"(%s, %s, %s, %s)\\n\", \$1, \$2, \$3, \$4 }" <<<"$data")
+        [[ "$(select_rows "$out")" == "$expected" ]] || { echo "where_filters: $sql" >&2; return 1; }
+    done
+}
+
+t_where_errors() {
+    # A WHERE or column list that doesn't fit the table, or doesn't parse, gets
+    # exactly one error and runs nothing. Nesting is limited to 64 levels of
+    # NOT or parentheses: the 65th is refused at the token that exceeds it.
+    local nots parens
+    nots=$(printf 'NOT %.0s' $(seq 1 65))
+    parens=$(printf '(%.0s' $(seq 1 65))
+    check_error_cases \
+        "SELECT nick FROM users" \
+        "Error: no such column: nick." \
+        "SELECT * FROM users WHERE nick = 1" \
+        "Error: no such column: nick." \
+        "SELECT * FROM users WHERE id = 'abc'" \
+        "Type error: cannot compare INT column 'id' with 'abc'." \
+        "SELECT * FROM users WHERE username < 42" \
+        "Type error: cannot compare TEXT column 'username' with 42." \
+        "SELECT * FROM users WHERE id = username" \
+        "Type error: cannot compare INT column 'id' with TEXT column 'username'." \
+        "SELECT * FROM users WHERE 42 = 'abc'" \
+        "Type error: cannot compare 42 with 'abc'." \
+        "SELECT * FROM users WHERE 'abc' = id" \
+        "Type error: cannot compare 'abc' with INT column 'id'." \
+        "SELECT * FROM users WHERE id = 99999999999999999999" \
+        "Type error: 99999999999999999999 is out of range for comparison with INT column 'id'." \
+        "SELECT * FROM users WHERE id 5" \
+        "Syntax error: expected a comparison operator near '5' at column 30." \
+        "SELECT * FROM users WHERE (id = 5" \
+        "Syntax error: expected ')' at end of statement." \
+        "SELECT * FROM users WHERE id = 5)" \
+        "Syntax error: expected end of statement near ')' at column 33." \
+        "SELECT * FROM users WHERE" \
+        "Syntax error: expected a column or a value at end of statement." \
+        "SELECT * FROM users WHERE AND id = 1" \
+        "Syntax error: expected a column or a value near 'AND' at column 27." \
+        "SELECT * FROM users WHERE id = 1 AND" \
+        "Syntax error: expected a column or a value at end of statement." \
+        "EXPLAIN INSERT INTO users VALUES (1, 'a', 'b')" \
+        "Syntax error: expected SELECT near 'INSERT' at column 9." \
+        "EXPLAIN" \
+        "Syntax error: expected SELECT at end of statement." \
+        "SELECT * FROM users WHERE ${nots}id = 1" \
+        "Syntax error: expression nested too deeply at column 283." \
+        "SELECT * FROM users WHERE ${parens}id = 1" \
+        "Syntax error: expression nested too deeply at column 91." || return 1
+
+    # 64 levels are fine: 64 NOTs cancel out, and 64 parentheses change nothing.
+    local out
+    nots=$(printf 'NOT %.0s' $(seq 1 64))
+    parens=$(printf '(%.0s' $(seq 1 64))
+    local closes
+    closes=$(printf ')%.0s' $(seq 1 64))
+    out=$(run "$(inserts 1 2)"$'\n'"SELECT * FROM users WHERE ${nots}id = 1;"$'\n'"SELECT * FROM users WHERE ${parens}id = 2${closes};"$'\n.exit\n')
+    [[ "$(select_rows "$out")" == "$(expected_rows 1 2)" ]]
+}
+
+t_explain_and_ranges() {
+    # The planner turns conditions on the primary key into a point lookup or a
+    # range, clamped to the keys that can exist, and falls back to a scan for
+    # anything it can't use. EXPLAIN prints the plan with its real bounds.
+    local out i
+    run "$(inserts $(seq 1 1000))"$'\n.exit\n' >/dev/null
+    local plans=(
+        ""                                               "SCAN users"
+        "WHERE id = 5"                                   "SEARCH users USING PRIMARY KEY (id = 5)"
+        "WHERE id > 10 AND id <= 20"                     "SEARCH users USING PRIMARY KEY (id >= 11 AND id <= 20)"
+        "WHERE id >= 11"                                 "SEARCH users USING PRIMARY KEY (id >= 11)"
+        "WHERE 20 >= id"                                 "SEARCH users USING PRIMARY KEY (id <= 20)"
+        "WHERE 5 < id AND id < 8"                        "SEARCH users USING PRIMARY KEY (id >= 6 AND id <= 7)"
+        "WHERE id > 3 AND id < 10 AND id >= 5"           "SEARCH users USING PRIMARY KEY (id >= 5 AND id <= 9)"
+        "WHERE (id > 990 AND (id < 995))"                "SEARCH users USING PRIMARY KEY (id >= 991 AND id <= 994)"
+        "WHERE id > 990 AND username != 'x'"             "SEARCH users USING PRIMARY KEY (id >= 991)"
+        "WHERE id >= -5 AND id <= 3"                     "SEARCH users USING PRIMARY KEY (id <= 3)"
+        "WHERE id >= 2147483647"                         "SEARCH users USING PRIMARY KEY (id = 2147483647)"
+        "WHERE id > 5 AND id < 3"                        "SEARCH users USING PRIMARY KEY (no row can match)"
+        "WHERE id = 7 AND id = 8"                        "SEARCH users USING PRIMARY KEY (no row can match)"
+        "WHERE id < -5"                                  "SEARCH users USING PRIMARY KEY (no row can match)"
+        "WHERE id > 2147483647"                          "SEARCH users USING PRIMARY KEY (no row can match)"
+        "WHERE id = 5 OR id = 6"                         "SCAN users"
+        "WHERE NOT id = 5"                               "SCAN users"
+        "WHERE id != 5"                                  "SCAN users"
+        "WHERE username = 'user5'"                       "SCAN users"
+        "WHERE id < 3000000000"                          "SCAN users"
+        "WHERE id >= 0"                                  "SCAN users"
+    )
+    for (( i = 0; i < ${#plans[@]}; i += 2 )); do
+        out=$(query "EXPLAIN SELECT * FROM users ${plans[i]};")
+        [[ "$(plan_line "$out")" == "${plans[i + 1]}" ]] || { echo "explain: ${plans[i]}" >&2; return 1; }
+        [[ "$(rows_examined "$out")" == 0 ]] || return 1
+    done
+
+    # Rows read, not rows returned: a lookup reads one row or none, a range
+    # exactly the rows inside it, and only a scan reads all 1,000.
+    local counts=(
+        "WHERE id = 500"                        1    "500"
+        "WHERE id = 5000"                       0    ""
+        "WHERE id > 10 AND id <= 20"            10   "$(seq 11 20)"
+        "WHERE id >= 995"                       6    "$(seq 995 1000)"
+        "WHERE id > 2000"                       0    ""
+        "WHERE id > 5 AND id < 3"               0    ""
+        "WHERE id > 990 AND username != 'user995'"  10  "$(seq 991 994; seq 996 1000)"
+        "WHERE username = 'user7'"              1000 "7"
+        "WHERE id = 999 OR id = 2"              1000 "$(printf '2\n999')"
+    )
+    for (( i = 0; i < ${#counts[@]}; i += 3 )); do
+        out=$(query "SELECT id FROM users ${counts[i]};")
+        [[ "$(rows_examined "$out")" == "${counts[i + 1]}" ]] || { echo "count: ${counts[i]}" >&2; return 1; }
+        [[ "$(sed -nE 's/^(db > )?\(([0-9]+)\)$/\2/p' <<<"$out")" == "${counts[i + 2]}" ]] || { echo "rows: ${counts[i]}" >&2; return 1; }
+    done
+
+    # On the 3-key build, a tree several levels deep built from even ids in a
+    # scrambled order: ranges must return exactly the even ids inside them and
+    # read nothing else, including ranges that start below the smallest key,
+    # end past the largest, fall in a gap, or start and end exactly on the
+    # separators the tree routes by.
+    local DB="$SMALL_FANOUT_DB" low high ids separators expected
+    require_small_fanout || return 1
+    ids=$(for i in $(scrambled 211); do echo $(( 2 * i )); done)
+    run "$(inserts $ids)"$'\n.exit\n' >/dev/null
+    out=$(printf '.btree users\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    separators=$(sed -nE 's/^ *- key ([0-9]+)$/\1/p' <<<"$(btree_block "$out")")
+    [[ $(wc -l <<<"$separators") -ge 10 ]] || return 1
+    local ranges=("0 5" "3 9" "1 1" "400 1000" "421 500" "101 101" "100 100")
+    for low in $separators; do
+        ranges+=("$low $(( low + 10 ))" "$(( low + 1 )) $(( low + 9 ))" "$(( low - 9 )) $low")
+    done
+    for i in "${!ranges[@]}"; do
+        read -r low high <<<"${ranges[i]}"
+        out=$(query "SELECT * FROM users WHERE id >= $low AND id <= $high;")
+        expected=$(for (( id = (low + 1) / 2 * 2; id <= high; id += 2 )); do (( id >= 2 && id <= 420 )) && echo "$id"; done)
+        [[ "$(select_rows "$out")" == "$( [[ -n "$expected" ]] && expected_rows $expected)" ]] || { echo "range: $low $high" >&2; return 1; }
+        [[ "$(rows_examined "$out")" == "$(grep -c . <<<"$expected")" ]] || { echo "range count: $low $high" >&2; return 1; }
+    done
+}
+
 t_duplicate_key() {
     # The second insert of id 1 must be rejected, leaving exactly one row.
     local out
@@ -1078,7 +1324,7 @@ t_duplicate_key() {
     [[ $(grep -cF '(1, user1, person1@example.com)' <<<"$out") -eq 1 ]]
 }
 
-ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split select_multilevel select_empty btree_nonroot_split btree_internal_split btree_internal_split_persists large_table file_header file_rejects_foreign sql_syntax_errors sql_binding_errors sql_lexical create_table create_table_errors many_tables catalog_corrupt)
+ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split select_multilevel select_empty btree_nonroot_split btree_internal_split btree_internal_split_persists large_table file_header file_rejects_foreign sql_syntax_errors sql_binding_errors sql_lexical create_table create_table_errors many_tables catalog_corrupt select_columns where_filters where_errors explain_and_ranges)
 
 run_one() {
     if "t_$1"; then

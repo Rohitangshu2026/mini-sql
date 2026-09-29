@@ -47,6 +47,13 @@ Cursor* table_find(Table* table, uint32_t key);
 void* cursor_value(Cursor* cursor);
 
 /*
+ * The key of the cell the cursor points at, read straight from the leaf, so a
+ * range scan can tell it has gone past its end without decoding the row. The
+ * cursor must not be at end_of_table.
+ */
+uint32_t cursor_key(Cursor* cursor);
+
+/*
  * Moves the cursor to the next cell in key order, crossing into the next leaf
  * after the last cell of this one, and setting end_of_table after the last
  * cell of the rightmost leaf.

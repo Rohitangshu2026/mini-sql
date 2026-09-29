@@ -82,6 +82,7 @@ static void show_constants(Database* db, uint32_t num_words, char* words[]){
  *
  *   .exit              flush and close the database, then terminate the process.
  *   .tables            list the tables, in the order they were created.
+ *   .stats             how many rows the last SELECT read, matching or not.
  *   .schema [TABLE]    print the CREATE TABLE text of one table or all.
  *   .btree TABLE       print a table's tree, one node per line, indented by depth.
  *   .constants [TABLE] print the on-page layout sizes, a table's included.
@@ -109,6 +110,8 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Database* db){
         for(uint32_t i = 0; i < db->num_tables; ++i)
             printf("%s\n", db->tables[i]->name);
     }
+    else if(num_words == 1 && strcmp(words[0], ".stats") == 0)
+        printf("Rows examined: %llu\n", (unsigned long long)db->last_rows_examined);
     else if(num_words >= 1 && strcmp(words[0], ".schema") == 0)
         show_schema(db, num_words, words);
     else if(num_words >= 1 && strcmp(words[0], ".btree") == 0)

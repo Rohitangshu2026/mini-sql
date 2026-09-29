@@ -69,6 +69,13 @@ void* cursor_value(Cursor* cursor){
     return leaf_node_value(page, cursor->cell_num, cursor->table->schema);
 }
 
+/* Reads the key of the cell under the cursor, which is the first field of the cell. */
+uint32_t cursor_key(Cursor* cursor){
+    void* page = pager_get_page(cursor->table->pager, cursor->page_num);
+    assert(get_node_type(page) == NODE_LEAF);
+    return *leaf_node_key(page, cursor->cell_num, cursor->table->schema);
+}
+
 /*
  * Advances to the next cell in key order.
  *

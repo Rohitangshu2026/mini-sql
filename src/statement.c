@@ -2,6 +2,7 @@
 
 #include<stdarg.h>
 #include<stdio.h>
+#include<stdlib.h>
 #include<string.h>
 
 /*
@@ -159,13 +160,51 @@ static PrepareResult bind_insert(Database* db, const InsertAst* insert, Statemen
     return PREPARE_SUCCESS;
 }
 
-/* Binds a SELECT, which for now only has to name a table that exists. */
-static PrepareResult bind_select(Database* db, const SelectAst* select, Statement* statement, SqlError* error){
+/*
+ * Binds a SELECT: the table, then the columns to print — every column in
+ * order for '*', or each named one, repeats allowed — then the WHERE, and
+ * finally chooses how to read the table. Everything is checked before the
+ * statement keeps anything, so an error leaves nothing to free.
+ */
+static PrepareResult bind_select(Database* db, const SelectAst* select, bool explain, Statement* statement,
+                                 SqlError* error){
     Table* table = bind_table(db, select->table_name, error);
     if(table == NULL)
         return PREPARE_ERROR;
+
+    const Schema* schema = table->schema;
+    uint32_t num_columns = select->column_names == NULL ? schema->num_columns : select->num_columns;
+    uint32_t* column_ids = malloc(num_columns * sizeof(uint32_t));
+    for(uint32_t i = 0; i < num_columns; ++i){
+        if(select->column_names == NULL){
+            column_ids[i] = schema->columns[i].column_id;
+            continue;
+        }
+        const ColumnDefinition* column = schema_find_column_by_name(schema, select->column_names[i]);
+        if(column == NULL){
+            set_error(error, "Error: no such column: %s.", select->column_names[i]);
+            free(column_ids);
+            return PREPARE_ERROR;
+        }
+        column_ids[i] = column->column_id;
+    }
+
+    BoundExpr* where = NULL;
+    if(select->where != NULL){
+        where = expression_bind(select->where, schema, error);
+        if(where == NULL){
+            free(column_ids);
+            return PREPARE_ERROR;
+        }
+    }
+
     statement->type = STATEMENT_SELECT;
     statement->table = table;
+    statement->column_ids = column_ids;
+    statement->num_columns = num_columns;
+    statement->where = where;
+    statement->plan = plan_select(where, table->key_column_id);
+    statement->explain = explain;
     return PREPARE_SUCCESS;
 }
 
@@ -205,7 +244,7 @@ PrepareResult prepare_statement(Database* db, const char* sql, Statement* statem
             result = bind_insert(db, &ast.insert, statement, error);
             break;
         case AST_SELECT:
-            result = bind_select(db, &ast.select, statement, error);
+            result = bind_select(db, &ast.select, ast.explain, statement, error);
             break;
         case AST_CREATE_TABLE:
             result = bind_create_table(db, &ast.create_table, statement, error);
@@ -216,8 +255,15 @@ PrepareResult prepare_statement(Database* db, const char* sql, Statement* statem
     return result;
 }
 
-/* Frees an insert's row and a definition that was never turned into a table. */
+/*
+ * Frees an insert's row, a definition that was never turned into a table, and
+ * a select's column list and WHERE.
+ */
 void statement_free(Statement* statement){
     record_free(&statement->record_to_insert);
     table_definition_free(&statement->definition);
+    free(statement->column_ids);
+    statement->column_ids = NULL;
+    expression_free(statement->where);
+    statement->where = NULL;
 }

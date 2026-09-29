@@ -49,4 +49,8 @@ void deserialize_record(const void* source, Record* record, const Schema* schema
 /* Prints the row as "(col1, col2, ...)" using each column's declared type. */
 void print_record(const Record* record, const Schema* schema);
 
+/* Prints only the columns `column_ids` of the row, in that order, like print_record. */
+void print_record_columns(const Record* record, const Schema* schema, const uint32_t* column_ids,
+                          uint32_t num_columns);
+
 #endif

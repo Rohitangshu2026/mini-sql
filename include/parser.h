@@ -40,9 +40,58 @@ typedef struct{
     uint32_t num_values;
 }InsertAst;
 
-/* SELECT * FROM table */
+/* The comparison operators a WHERE clause can use. != and <> are the same. */
+typedef enum{
+    COMPARE_EQUAL,
+    COMPARE_NOT_EQUAL,
+    COMPARE_LESS,
+    COMPARE_LESS_EQUAL,
+    COMPARE_GREATER,
+    COMPARE_GREATER_EQUAL
+}CompareOp;
+
+/* One side of a comparison: a column, named as written, or a literal. */
+typedef enum{
+    OPERAND_COLUMN,
+    OPERAND_LITERAL
+}OperandKind;
+
+typedef struct{
+    OperandKind kind;
+    char* column_name;      /* OPERAND_COLUMN: heap-owned */
+    Literal literal;        /* OPERAND_LITERAL */
+}OperandAst;
+
+/* The kinds of node in a WHERE expression. */
+typedef enum{
+    EXPR_COMPARISON,
+    EXPR_AND,
+    EXPR_OR,
+    EXPR_NOT
+}ExprKind;
+
+/*
+ * A node of a WHERE expression. A comparison holds its operator and both
+ * operands. AND and OR hold a list of two or more operands rather than a pair,
+ * so a long chain like a AND b AND c ... stays one level deep instead of
+ * becoming a tree as deep as it is long; NOT holds exactly one.
+ */
+typedef struct ExprAst{
+    ExprKind kind;
+    CompareOp op;                 /* EXPR_COMPARISON */
+    OperandAst left;              /* EXPR_COMPARISON */
+    OperandAst right;             /* EXPR_COMPARISON */
+    struct ExprAst** children;    /* AND, OR, NOT: heap-owned */
+    uint32_t num_children;
+    uint32_t capacity;            /* slots in `children` */
+}ExprAst;
+
+/* SELECT * | column, ... FROM table [WHERE expression] */
 typedef struct{
     char* table_name;       /* heap-owned */
+    char** column_names;    /* heap-owned; NULL for SELECT * */
+    uint32_t num_columns;
+    ExprAst* where;         /* heap-owned; NULL without a WHERE clause */
 }SelectAst;
 
 /* A column's declared type, as written: INT, or TEXT with a width. */
@@ -79,9 +128,13 @@ typedef enum{
     AST_CREATE_TABLE
 }AstKind;
 
-/* A parsed statement: its kind, and the node for that kind. */
+/*
+ * A parsed statement: its kind, the node for that kind, and whether it was
+ * prefixed with EXPLAIN (only a SELECT can be).
+ */
 typedef struct{
     AstKind kind;
+    bool explain;
     union{
         InsertAst insert;
         SelectAst select;

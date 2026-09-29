@@ -95,20 +95,38 @@ void deserialize_record(const void* source, Record* record, const Schema* schema
 }
 
 /*
- * Prints the row as "(v1, v2, ...)", formatting each field by its column type.
- * Text is printed with a width limit so an unterminated full-width field can't
- * over-read past its slot.
+ * Prints one field, formatted by its column type. Text is printed with a width
+ * limit so an unterminated full-width field can't over-read past its slot.
  */
+static void print_field(const Record* record, const Schema* schema, const ColumnDefinition* column){
+    if(column->type == COLUMN_INT)
+        printf("%d", record_get_int(record, schema, column->column_id));
+    else if(column->type == COLUMN_TEXT)
+        printf("%.*s", (int)column->size, record_get_text(record, schema, column->column_id));
+}
+
+/* Prints the whole row as "(v1, v2, ...)", in column order. */
 void print_record(const Record* record, const Schema* schema){
     printf("(");
     for(uint32_t i = 0; i < schema->num_columns; ++i){
-        const ColumnDefinition* column = &schema->columns[i];
         if(i > 0)
             printf(", ");
-        if(column->type == COLUMN_INT)
-            printf("%d", record_get_int(record, schema, column->column_id));
-        else if(column->type == COLUMN_TEXT)
-            printf("%.*s", (int)column->size, record_get_text(record, schema, column->column_id));
+        print_field(record, schema, &schema->columns[i]);
+    }
+    printf(")\n");
+}
+
+/*
+ * Prints the chosen columns of the row, in the order given — which is how a
+ * SELECT's column list prints, repeats included.
+ */
+void print_record_columns(const Record* record, const Schema* schema, const uint32_t* column_ids,
+                          uint32_t num_columns){
+    printf("(");
+    for(uint32_t i = 0; i < num_columns; ++i){
+        if(i > 0)
+            printf(", ");
+        print_field(record, schema, schema_find_column_by_id(schema, column_ids[i]));
     }
     printf(")\n");
 }
