@@ -9,16 +9,17 @@ A SQLite-style database engine, built from scratch in C — one layer at a time.
 but **deliberately diverges in one important way**: where the tutorial hardcodes
 a single `Row` struct and compile-time byte offsets, `mini-sql` is **schema-driven
 from the first commit**. The layout of a row is *computed at runtime* from a
-`Schema`, not frozen by the C compiler. That single decision is what keeps the
-door open to `CREATE TABLE`, `ALTER TABLE`, and multiple tables without a rewrite.
+`Schema`, not frozen by the C compiler. That single decision is what made
+`CREATE TABLE` and any number of tables possible without a rewrite.
 
-Today it is a **persistent B+ tree** over a single table. Rows are kept sorted by
-primary key in 4 KiB leaf pages; internal pages route lookups, so finding a key
-costs one binary search per level; full nodes, leaf or internal, split and cascade
-up to a new root, so the tree grows to any depth; and a chain of sibling pointers
-lets a scan return every row in key order. The pager caches pages in memory and
-writes them to a single database file. Every part of the tutorial's storage engine
-is in place.
+Today it holds **any number of tables in one file**, each defined at runtime with
+`CREATE TABLE` and recorded in a catalog that is itself a table. Every table is a
+**persistent B+ tree**: rows are kept sorted by primary key in 4 KiB leaf pages;
+internal pages route lookups, so finding a key costs one binary search per level;
+full nodes, leaf or internal, split and cascade up to a new root, so the tree grows
+to any depth; and a chain of sibling pointers lets a scan return every row in key
+order. The pager caches pages in memory and writes them to a single database file.
+Every part of the tutorial's storage engine is in place.
 
 ---
 
@@ -57,16 +58,18 @@ ctest --test-dir build        # run the test suite
 ```
 
 The binary takes the database filename as an argument and reads one SQL statement
-per line. Rows are stored in key order whatever order they arrive in, duplicate
-keys are rejected, bad statements say exactly what's wrong, and everything survives
-a restart:
+per line. A new database has no tables until you create them. Rows are stored in
+key order whatever order they arrive in, duplicate keys are rejected, bad
+statements say exactly what's wrong, and everything survives a restart:
 
 ```text
 $ ./build/mini_sql mydb.db
+db > CREATE TABLE users (id INT PRIMARY KEY, username TEXT(32), email TEXT(255));
+Executed. (0.002 ms)
 db > INSERT INTO users VALUES (3, 'carol', 'carol@example.com');
 Executed. (0.000 ms)
 db > INSERT INTO users VALUES (1, 'alice', 'alice@example.com');
-Executed. (0.001 ms)
+Executed. (0.000 ms)
 db > INSERT INTO users (email, id, username) VALUES ('bob@example.com', 2, 'Bob Smith');
 Executed. (0.000 ms)
 db > INSERT INTO users VALUES (1, 'again', 'again@example.com');
@@ -75,7 +78,14 @@ db > INSERT INTO users VALUES ('four', 'dan', 'dan@example.com');
 Type error: column 'id' is INT, but 'four' is text.
 db > SELECT * FORM users;
 Syntax error: expected FROM near 'FORM' at column 10.
-db > .btree
+db > CREATE TABLE orders (total INT, id INT PRIMARY KEY, note TEXT(40));
+Executed. (0.001 ms)
+db > INSERT INTO orders VALUES (-5, 7, 'refund');
+Executed. (0.001 ms)
+db > .tables
+users
+orders
+db > .btree users
 Tree:
 - leaf (size 3)
   - 1
@@ -88,13 +98,16 @@ db > SELECT * FROM users;
 (1, alice, alice@example.com)
 (2, Bob Smith, bob@example.com)
 (3, carol, carol@example.com)
-Executed. (0.008 ms)
+Executed. (0.005 ms)
+db > .schema orders
+CREATE TABLE orders (total INT, id INT PRIMARY KEY, note TEXT(40));
 db > .exit
 ```
 
-`.btree` prints the tree's shape and `.constants` prints the on-page layout sizes.
-The trailing `;` is optional, keywords and names ignore case, and `--` starts a
-comment.
+`.tables` lists the tables and `.schema [TABLE]` prints their definitions;
+`.btree TABLE` prints a table's tree and `.constants [TABLE]` the on-page layout
+sizes. The trailing `;` is optional, keywords and names ignore case, and `--`
+starts a comment.
 
 Requirements: a C11 compiler (Apple Clang / GCC), CMake ≥ 3.20, and `bash` for the
 tests. No third-party libraries.
@@ -106,11 +119,13 @@ tests. No third-party libraries.
 | Capability | Status |
 | --- | --- |
 | Interactive REPL with `db >` prompt | ✅ |
-| Meta-commands: `.exit`, `.btree`, `.constants` | ✅ |
+| Meta-commands: `.exit`, `.tables`, `.schema`, `.btree`, `.constants` | ✅ |
 | **SQL front end**: tokenizer, recursive-descent parser, binder | ✅ |
-| `INSERT INTO users [(columns)] VALUES (…)` into a fixed `users` schema | ✅ |
-| `SELECT * FROM users` — full scan, rows in primary-key order | ✅ |
-| **Syntax and type errors** that name the problem and its column position | ✅ |
+| **`CREATE TABLE`** with INT and TEXT(n) columns and an INT PRIMARY KEY, validated | ✅ |
+| **Any number of tables** in one file, listed in a catalog that is itself a table | ✅ |
+| `INSERT INTO t [(columns)] VALUES (…)` | ✅ |
+| `SELECT * FROM t` — full scan, rows in primary-key order | ✅ |
+| **Syntax, type and schema errors** that name the problem and, for syntax, its column | ✅ |
 | **B+ tree storage**: sorted leaves, internal routing nodes | ✅ |
 | **O(log n) lookup**: binary search per node, descending from the root | ✅ |
 | **Duplicate primary keys rejected** | ✅ |
@@ -118,15 +133,15 @@ tests. No third-party libraries.
 | **Splits below the root** that update the parent's separators and children | ✅ |
 | **Internal-node splits** that cascade up to a new root — a tree of any depth | ✅ |
 | **Scans across leaves** through a sibling-pointer chain | ✅ |
-| Input validation (syntax, negative id, over-length text) | ✅ |
-| Schema-driven row (de)serialization | ✅ |
+| Input validation (syntax, negative keys, over-length text) | ✅ |
+| Schema-driven row (de)serialization, with layouts from `CREATE TABLE` | ✅ |
 | Persistence to a single database file | ✅ |
 | **Page cache that grows with the file** — no page limit | ✅ |
 | **Versioned file header**: foreign, older or corrupt files are refused, never misread | ✅ |
 | Per-statement execution timing | ✅ |
-| Black-box test suite (22 CTest cases) with a B+ tree invariant checker | ✅ |
+| Black-box test suite (26 CTest cases) with a B+ tree invariant checker | ✅ |
 | `WHERE`, `DELETE`, `UPDATE` | ⛔ |
-| `CREATE TABLE` / multiple tables | ⛔ single hardcoded schema |
+| `DROP TABLE`, `ALTER TABLE` | ⛔ |
 | Crash safety (journal / WAL) | ⛔ flush happens only on clean `.exit` |
 
 ---
@@ -135,8 +150,9 @@ tests. No third-party libraries.
 
 The engine is a classic **front-end / back-end** split. The front end turns text
 into a validated `Statement` in three steps — tokens, a syntax tree, then a check
-against the table's schema; the back end executes it through a cursor, which
-navigates the B-tree, which reads and writes pages through the pager.
+against the database's tables; the back end executes it through a cursor, which
+navigates the table's B-tree, which reads and writes pages through the pager. The
+database ties it together: it owns the file, the catalog and the open tables.
 
 ```mermaid
 flowchart TD
@@ -149,16 +165,19 @@ flowchart TD
 
     subgraph Frontend["Front end — compile & validate"]
         META["meta_command — dot-commands"]
-        STMT["statement — binder: check the tree, build the row"]
+        STMT["statement — binder: tables, columns, values"]
+        DEF["table_definition — CREATE TABLE checks + canonical SQL"]
         PARSE["parser — recursive descent into a syntax tree"]
         TOK["tokenizer — tokens with column positions"]
     end
 
     subgraph Backend["Back end — execute & store"]
-        EXEC["executor — insert / select"]
-        CUR["cursor — navigate the tree"]
-        TABLE["table — db_open / db_close"]
-        HDR["file_header — page 0: format, page size, root"]
+        EXEC["executor — insert / select / create"]
+        DB["database — file, catalog, open tables"]
+        CAT["catalog — the table of tables"]
+        TABLE["table — one B-tree: schema, key, root"]
+        CUR["cursor — navigate a tree"]
+        HDR["file_header — page 0: format, page size, catalog root"]
         BTREE["btree — node format, search, split"]
         REC["record — row (de)serialization"]
         SCHEMA["schema — column layout"]
@@ -172,18 +191,23 @@ flowchart TD
     REPL --> STMT
     REPL --> EXEC
     STMT --> PARSE
+    STMT --> DEF
+    STMT --> DB
     PARSE --> TOK
-    STMT --> REC
-    STMT --> SCHEMA
+    DEF --> PARSE
+    DEF --> SCHEMA
+    EXEC --> DB
     EXEC --> CUR
-    EXEC --> BTREE
-    CUR --> BTREE
+    META --> DB
+    DB --> CAT
+    DB --> HDR
+    DB --> DEF
+    CAT --> TABLE
+    CAT --> CUR
+    TABLE --> CUR
     TABLE --> BTREE
-    TABLE --> HDR
-    TABLE --> PAGER
+    CUR --> BTREE
     HDR --> PAGER
-    META --> BTREE
-    META --> TABLE
     BTREE --> PAGER
     BTREE --> REC
     REC --> SCHEMA
@@ -193,8 +217,9 @@ flowchart TD
 The layering runs one way: **executor → cursor → btree → pager**. `btree` knows
 page numbers and node bytes but nothing about tables or cursors; `cursor` chains
 btree's per-node answers into tree navigation; the executor only ever talks to a
-cursor. That's why `execute_select` has not changed since the table was an
-array — the storage underneath it became a B-tree without it noticing.
+cursor. That's why `execute_select` has barely changed since the table was an
+array — the storage underneath it became a B-tree, then one of many, without it
+noticing.
 
 ---
 
@@ -241,6 +266,10 @@ Every row but the code generator and VM is a real counterpart. Those two are the
 honest gap: the binder produces a ready-to-run `Statement` rather than a program —
 see [limitations](#limitations--non-goals).
 
+The catalog follows SQLite's `sqlite_schema` closely: a table holding each table's
+name, root page and `CREATE TABLE` text, which is parsed again every time the
+database is opened.
+
 ---
 
 ## Module dependency graph
@@ -256,25 +285,43 @@ flowchart BT
     main --> meta_command
     main --> statement
     main --> executor
-    main --> schema
-    main --> table
+    main --> database
 
     meta_command --> input_buffer
-    meta_command --> table
+    meta_command --> database
     meta_command --> btree
+    executor --> statement
+    executor --> database
+    executor --> cursor
+    statement --> database
     statement --> parser
     statement --> record
-    parser --> tokenizer
-    executor --> statement
-    executor --> table
-    executor --> cursor
-    executor --> btree
+    statement --> table
+    statement --> table_definition
+    database --> catalog
+    database --> table
+    database --> table_definition
+    database --> file_header
+    database --> parser
+    database --> pager
+    database --> btree
+    catalog --> table
+    catalog --> table_definition
+    catalog --> parser
+    catalog --> cursor
+    catalog --> pager
+    table --> table_definition
+    table --> cursor
+    table --> btree
+    table --> pager
+    table --> record
+    table --> schema
+    table_definition --> parser
+    table_definition --> schema
+    table_definition --> btree
     cursor --> table
     cursor --> btree
-    table --> btree
-    table --> file_header
-    table --> pager
-    table --> schema
+    parser --> tokenizer
     file_header --> pager
     btree --> pager
     btree --> record
@@ -285,6 +332,11 @@ flowchart BT
     class schema,input_buffer,pager,tokenizer leaf;
 ```
 
+`table` and `cursor` reach each other in both directions: `cursor.h` includes
+`table.h` for the struct a cursor points into, and `table.c` uses a cursor to find
+where `table_insert` belongs. The cycle is between modules, not headers — `table.h`
+doesn't include `cursor.h` — so it compiles in any order.
+
 | Module | Responsibility | Key entry points |
 | --- | --- | --- |
 | `input_buffer` | Read a line of stdin into a growable buffer | `new_input_buffer`, `read_input`, `close_input_buffer` |
@@ -294,12 +346,15 @@ flowchart BT
 | `schema` | Runtime column layout: types, sizes, **computed offsets**; case-insensitive name lookup | `schema_create`, `schema_find_column_by_id/name`, `schema_names_equal`, `schema_free` |
 | `record` | An opaque row payload + schema-keyed get/set + (de)serialize | `record_init`, `record_set_int/text`, `serialize_record`, `print_record` |
 | `pager` | Growable page cache backed by a file; allocates zeroed pages, reads on miss, flushes on close | `pager_open`, `pager_get_page`, `get_unused_page_num`, `pager_flush`, `pager_close` |
-| `file_header` | Page 0's layout: writes a new header, validates an existing one, reads the root page | `file_header_initialize`, `file_header_validate`, `file_header_root_page` |
-| `btree` | Leaf and internal node formats, per-node binary search, leaf split and root growth, tree printer | `leaf_node_insert`, `leaf_node_find_cell`, `internal_node_find_child`, `leaf_node_next_leaf`, `print_tree` |
-| `table` | Opens/closes a database connection; writes the header and root of a new file, refuses a file it can't read | `db_open`, `db_close` |
+| `file_header` | Page 0's layout: writes a new header, validates an existing one, reads the catalog root | `file_header_initialize`, `file_header_validate`, `file_header_catalog_root_page` |
+| `btree` | Leaf and internal node formats, per-node binary search, splits, tree printer, row-size limit | `leaf_node_insert`, `leaf_node_find_cell`, `internal_node_find_child`, `leaf_node_max_row_size`, `print_tree` |
+| `table_definition` | Checks a parsed `CREATE TABLE` and builds its schema, key column and canonical SQL | `table_definition_from_ast`, `table_definition_free` |
+| `table` | One table: its B-tree root, schema, key column and definition; inserts a row by key | `table_create`, `table_insert`, `table_free` |
+| `catalog` | The table of tables: its own definition in SQL, adding and reading entries | `catalog_open`, `catalog_add`, `catalog_load` |
+| `database` | Opens a file (new, or checked and loaded from its catalog), creates and finds tables, closes | `db_open`, `db_close`, `database_find_table`, `database_create_table` |
 | `cursor` | A position in a leaf; tree descent and leaf-chain traversal | `table_start`, `table_find`, `cursor_value`, `cursor_advance` |
-| `statement` | The binder: check a syntax tree against the table, build the row; type and name errors | `prepare_statement`, `statement_set_default_table` |
-| `executor` | Run a prepared `Statement` against a `Table` via a cursor | `execute_statement` |
+| `statement` | The binder: resolve tables and columns, check values and definitions; type and schema errors | `prepare_statement`, `statement_free` |
+| `executor` | Run a prepared `Statement`: insert, scan, or create a table | `execute_statement` |
 | `main` | REPL loop + wiring + lifetime management | — |
 
 ---
@@ -309,14 +364,17 @@ flowchart BT
 The core structs and their ownership relationships (these encode the rules the
 code actually follows):
 
+- `Database` **owns** the `Pager`, the catalog and every open `Table`, and
+  `db_close` tears them all down.
+- `Table` **owns** its name, `Schema` and `CREATE TABLE` text, and **borrows** the
+  database's `Pager`. A table *is* a B-tree, identified by its root page, and knows
+  which column's value is its key. The catalog is a `Table` like any other.
 - `Schema` **owns** its `ColumnDefinition` array (deep copy, including names).
-- `Table` **owns** a `Pager` and **borrows** a `Schema` (taken at open, freed by
-  `db_close`). A table *is* a B-tree, identified by its root page — the page the
-  file header records, page 1 in a new database.
 - `Pager` **owns** the page cache and the open file descriptor.
 - `Cursor` **points into** a leaf of a `Table`; it owns nothing.
-- `Statement` **holds** a `Record` inline; `Record` is just bytes, **interpreted by**
-  a `Schema`.
+- `Statement` **holds** a `Record` inline and, for `CREATE TABLE`, a
+  `TableDefinition` until the table is created; `Record` is just bytes,
+  **interpreted by** a `Schema`.
 - `Ast`, the parser's syntax tree, **owns** its names and literal text, and lives
   only for the duration of `prepare_statement`.
 
@@ -342,9 +400,20 @@ classDiagram
         +uint32 capacity
         +pointer pages
     }
+    class Database {
+        +string filename
+        +Pager pager
+        +Table catalog
+        +Table tables
+        +uint32 num_tables
+        +uint32 next_table_id
+    }
     class Table {
+        +string name
         +Schema schema
+        +uint32 key_column_id
         +uint32 root_page_num
+        +string sql
         +Pager pager
     }
     class Cursor {
@@ -358,9 +427,11 @@ classDiagram
         +uint32 payload_size
     }
 
+    Database "1" *-- "1" Pager : owns
+    Database "1" *-- "many" Table : owns, catalog included
     Schema "1" *-- "many" ColumnDefinition : owns
-    Table "1" *-- "1" Pager : owns
-    Table "1" o-- "1" Schema : borrows
+    Table "1" *-- "1" Schema : owns
+    Table "many" o-- "1" Pager : borrows
     Cursor "1" o-- "1" Table : points into
     Record ..> Schema : interpreted by
 ```
@@ -374,8 +445,10 @@ COLUMN` a one-line metadata change instead of a code-wide find-and-replace.
 
 ## Row layout
 
-`schema_create` walks the column list once, assigning each column a byte `offset`
-and accumulating `row_size`. For the built-in `users` schema:
+`CREATE TABLE` lists the columns; `schema_create` walks them once, assigning each a
+byte `offset` and accumulating `row_size`. INT columns take 4 bytes and TEXT(n)
+columns n. For the `users` table used throughout this README and the tests,
+`CREATE TABLE users (id INT PRIMARY KEY, username TEXT(32), email TEXT(255))`:
 
 | Column | Type | Size (bytes) | Offset |
 | --- | --- | ---: | ---: |
@@ -399,7 +472,10 @@ flowchart LR
 ```
 
 The `id` column is the row's primary key: it is copied into the key slot of the
-cell that stores the row, and the tree is ordered by it.
+cell that stores the row, and the tree is ordered by it. The key can be any INT
+column — `CREATE TABLE orders (total INT, id INT PRIMARY KEY, …)` orders its rows
+by the second column. A row may take at most 1,356 bytes, so that a leaf always
+holds at least three.
 
 ---
 
@@ -410,8 +486,9 @@ The database file is an array of 4 KiB pages. **Page 0 is the file header**, and
 
 ```text
 page 0   file header
-page 1   root of the users table (in a new database)
-page 2…  every other node, each allocated at the end of the file as it's needed
+page 1   root of the catalog (in a new database)
+page 2…  table roots and every other node, each allocated at the end of the file
+         as it's needed — the first table created gets page 2 for its root
 ```
 
 ### The file header
@@ -419,26 +496,47 @@ page 2…  every other node, each allocated at the end of the file as it's neede
 | Bytes | Field |
 | --- | --- |
 | 0–15 | magic `mini-sql format\0`, after SQLite's `SQLite format 3\0` |
-| 16–19 | file format version — `1` |
+| 16–19 | file format version — `2` |
 | 20–23 | page size — `4096` |
-| 24–27 | page holding the table's root node |
+| 24–27 | page holding the catalog's root node |
 | 28–4095 | zero, reserved for fields later formats add |
 
-Opening a file checks the header before anything else, and refuses — with a
-message, and without writing a byte — a file that fails:
+### The catalog
+
+The catalog is the table of tables — one row per table — and an ordinary B-tree
+table itself. Its own definition is written in SQL and parsed at open by the same
+code as every other table's:
+
+```sql
+CREATE TABLE mini_sql_catalog (id INT PRIMARY KEY, name TEXT(64), root_page INT, sql TEXT(1024))
+```
+
+A catalog row is 1,096 bytes, so a catalog leaf holds three; a database with more
+tables splits the catalog like any other table. The `sql` column holds a canonical
+form of each `CREATE TABLE`, regenerated from the checked definition — which is
+also what `.schema` prints.
+
+### Opening a file
+
+Opening a file checks everything before a byte is written, and refuses — with a
+message — a file that fails:
 
 | Check | Message |
 | --- | --- |
 | length a whole number of pages | `Db file is not a whole number of pages. Corrupt file.` |
 | the magic | `Error: X is not a mini-sql database, or was written by an older build.` |
-| the format version | `Error: X uses file format 2; this build reads format 1.` |
+| the format version | `Error: X uses file format 1; this build reads format 2.` |
 | the page size | `Error: X uses 8192-byte pages; this build uses 4096.` |
-| the root is a node page | `Error: X is corrupt: its root page 99 is not a node page of the file.` |
+| the catalog root is a node page | `Error: X is corrupt: its catalog root page 99 is not a node page of the file.` |
+| each stored definition parses | `Error: X is corrupt: the stored definition of table users doesn't parse.` |
+| …and passes the `CREATE TABLE` checks | `Error: X is corrupt: the stored definition of table users is invalid.` |
+| …and is for the table the catalog names | `Error: X is corrupt: the catalog lists table xsers, but its definition is for users.` |
+| each table's root is a node page | `Error: X is corrupt: table users has root page 99, which is not a node page of the file.` |
 
 Every file written before the header existed has a node where the magic belongs, so
-it's refused by the second check rather than misread. Any change to what a file
-holds bumps the format version, so from here on old files are always refused
-cleanly.
+it's refused by the magic check rather than misread. Any change to what a file
+holds bumps the format version — the catalog made this format 2 — so older files
+are always refused cleanly.
 
 The header gets a whole page to itself. SQLite instead fits a 100-byte header at the
 start of its first page, which also holds a B-tree root; here every node starts at
@@ -508,16 +606,16 @@ keeps routing:
 
 ```mermaid
 flowchart TD
-    R["page 1 · internal root<br/>key 7"]
-    L["page 3 · leaf<br/>keys 1 – 7"]
-    RL["page 2 · leaf<br/>keys 8 – 15"]
+    R["page 2 · internal root<br/>key 7"]
+    L["page 4 · leaf<br/>keys 1 – 7"]
+    RL["page 3 · leaf<br/>keys 8 – 15"]
     R -->|"key ≤ 7"| L
     R -->|"key > 7"| RL
     L -.->|next_leaf| RL
 ```
 
 ```text
-db > .btree
+db > .btree users
 Tree:
 - internal (size 1)
   - leaf (size 7)
@@ -587,9 +685,10 @@ parent.
 | | before the 14th insert | after |
 | --- | --- | --- |
 | page 0 | header | header (unchanged) |
-| page 1 | leaf, 13 cells (root) | internal root: key 7 → page 3, else page 2 |
-| page 2 | — | leaf, keys 8–14, `next_leaf = 0` |
-| page 3 | — | leaf, keys 1–7 (copied from page 1), `next_leaf = 2` |
+| page 1 | catalog | catalog (unchanged) |
+| page 2 | leaf, 13 cells (root of `users`) | internal root: key 7 → page 4, else page 3 |
+| page 3 | — | leaf, keys 8–14, `next_leaf = 0` |
+| page 4 | — | leaf, keys 1–7 (copied from page 2), `next_leaf = 3` |
 
 ### Updating the parent — splitting a leaf below the root
 
@@ -616,11 +715,11 @@ rightmost leaf keeps splitting — and produces a four-leaf tree:
 
 ```mermaid
 flowchart TD
-    R["page 1 · internal root<br/>keys 7 | 14 | 21"]
-    L1["page 3 · leaf<br/>1 – 7"]
-    L2["page 2 · leaf<br/>8 – 14"]
-    L3["page 4 · leaf<br/>15 – 21"]
-    L4["page 5 · leaf<br/>22 – 30"]
+    R["page 2 · internal root<br/>keys 7 | 14 | 21"]
+    L1["page 4 · leaf<br/>1 – 7"]
+    L2["page 3 · leaf<br/>8 – 14"]
+    L3["page 5 · leaf<br/>15 – 21"]
+    L4["page 6 · leaf<br/>22 – 30"]
     R --> L1
     R --> L2
     R --> L3
@@ -661,7 +760,7 @@ makes the root `[7 | 14 | 21]` split when row 35 arrives:
 
 ```mermaid
 flowchart TD
-    R["page 1 · root<br/>key 14"]
+    R["page 2 · root<br/>key 14"]
     I1["internal<br/>key 7"]
     I2["internal<br/>keys 21 | 28"]
     R --> I1
@@ -725,32 +824,63 @@ sequenceDiagram
     participant M as main (REPL)
     participant S as statement (binder)
     participant Q as parser + tokenizer
+    participant D as database
     participant E as executor
+    participant T as table
     participant C as cursor
     participant B as btree
-    participant P as pager
 
     U->>M: INSERT INTO users VALUES (5, 'eve', 'eve@x.com');
-    M->>S: prepare_statement(line, &stmt, &error)
+    M->>S: prepare_statement(db, line, &stmt, &error)
     S->>Q: parse_statement(line, &ast, &error)
     Q-->>S: InsertAst{ users, values [5, 'eve', 'eve@x.com'] }
-    S->>S: table, value count, each value's type and size — then build the Record
+    S->>D: database_find_table(db, "users")
+    D-->>S: users (schema, key column id)
+    S->>S: value count, each value's type and size — then build the Record
     S->>S: ast_free(&ast)
     S-->>M: PREPARE_SUCCESS
 
-    M->>E: execute_statement(&stmt, table)
-    E->>C: table_find(table, 5)
+    M->>E: execute_statement(&stmt, db)
+    E->>T: table_insert(users, record)
+    T->>T: key = the value of the key column = 5
+    T->>C: table_find(users, 5)
     loop each internal node
-        C->>P: pager_get_page(page)
         C->>B: internal_node_find_child(node, 5)
     end
     C->>B: leaf_node_find_cell(leaf, 5)
-    C-->>E: Cursor(leaf page, cell)
-    E->>E: same key already in that cell? → EXECUTE_DUPLICATE_KEY
-    E->>B: leaf_node_insert(pager, page, cell, 5, record)
+    C-->>T: Cursor(leaf page, cell)
+    T->>T: same key already in that cell? → false (EXECUTE_DUPLICATE_KEY)
+    T->>B: leaf_node_insert(pager, page, cell, 5, record)
     B->>B: shift cells and write — or split if full
     E-->>M: EXECUTE_SUCCESS
     M-->>U: Executed. (0.003 ms)
+```
+
+### CREATE TABLE
+
+Checking a definition happens entirely in the binder; only once it's accepted does
+execution touch the file — one new page for the table's root, one catalog row.
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant S as statement (binder)
+    participant F as table_definition
+    participant E as executor
+    participant D as database
+    participant K as catalog
+
+    U->>S: CREATE TABLE orders (total INT, id INT PRIMARY KEY, note TEXT(40));
+    S->>D: database_find_table(db, "orders") → NULL, the name is free
+    S->>F: table_definition_from_ast(create)
+    F->>F: columns distinct, widths ≥ 1, one INT key, row ≤ 1,356 B, text ≤ 1,024 B
+    F-->>S: TableDefinition{ orders, schema, key = column 2, canonical SQL }
+    S-->>E: PREPARE_SUCCESS
+    E->>D: database_create_table(db, &definition)
+    D->>D: new page → empty root leaf
+    D->>K: catalog_add(next id, "orders", root page, sql)
+    K->>K: table_insert(catalog, row) — may split the catalog
+    D->>D: table_create(pager, root, definition) → tables[]
 ```
 
 ### SELECT
@@ -767,8 +897,8 @@ sequenceDiagram
     participant R as record
 
     U->>M: SELECT * FROM users;
-    M->>E: execute_statement(&stmt, table)
-    E->>C: table_start(table) = table_find(table, 0)
+    M->>E: execute_statement(&stmt, db)
+    E->>C: table_start(users) = table_find(users, 0)
     loop until cursor.end_of_table
         E->>C: cursor_value(cursor)
         C-->>E: pointer to the row in the leaf page
@@ -796,7 +926,7 @@ stateDiagram-v2
     Classify --> Meta : line starts with '.'
     Classify --> Prepare : otherwise
 
-    Meta --> Prompt : .btree / .constants / unrecognized
+    Meta --> Prompt : .tables / .schema / .btree / .constants / unrecognized
     Meta --> [*] : .exit (flush pages, close file, free all)
 
     Prepare --> Execute : PREPARE_SUCCESS
@@ -807,8 +937,8 @@ stateDiagram-v2
 ```
 
 The loop is infinite by construction; the only exit is `.exit`, which calls
-`db_close` (flush + close file + free pager, schema, and table) and then `exit()`
-from inside `do_meta_command`. There is no fall-through cleanup path because control
+`db_close` (flush + close file + free the pager, the catalog and every table) and
+then `exit()` from inside `do_meta_command`. There is no fall-through cleanup path because control
 never reaches the end of `main`.
 
 ---
@@ -830,8 +960,8 @@ flowchart LR
 ```
 
 The parser knows nothing about schemas — a table name is just text to it — which is
-what will let the catalog re-parse a stored `CREATE TABLE` before the table exists.
-The binder knows nothing about token positions.
+what lets the catalog re-parse each stored `CREATE TABLE` while the table is still
+being loaded. The binder knows nothing about token positions.
 
 **Tokens.** The lexical rules cover every statement the engine is planned to
 support, so later stages only add grammar:
@@ -848,10 +978,12 @@ support, so later stages only add grammar:
 **Grammar**, one parser function per rule:
 
 ```text
-statement := [ insert | select ] [ ';' ] END
-insert    := INSERT INTO name [ '(' name { ',' name } ')' ] VALUES '(' literal { ',' literal } ')'
-select    := SELECT '*' FROM name
-literal   := [ '-' ] INTEGER | STRING
+statement  := [ insert | select | create ] [ ';' ] END
+insert     := INSERT INTO name [ '(' name { ',' name } ')' ] VALUES '(' literal { ',' literal } ')'
+select     := SELECT '*' FROM name
+create     := CREATE TABLE name '(' column_def { ',' column_def } ')'
+column_def := name ( INT | TEXT '(' INTEGER ')' ) [ PRIMARY KEY ]
+literal    := [ '-' ] INTEGER | STRING
 ```
 
 The parser stops at the first error and frees whatever it had built. Anything after
@@ -866,8 +998,25 @@ before the row is allocated:
 2. a column list, if given, names only real columns, each once;
 3. there are as many values as columns;
 4. a column list leaves no column out — there are no NULLs or defaults;
-5. each value fits its column: INT takes an integer within int32 that isn't
-   negative, TEXT(n) takes a string of at most n bytes.
+5. each value fits its column: INT takes an integer within int32 — which, for
+   the key column, can't be negative — and TEXT(n) takes a string of at most n
+   bytes.
+
+**Defining tables.** `CREATE TABLE` is checked in the same spirit, most basic
+problem first. The name must be free — the one check that needs the database —
+and the rest belong to `table_definition`, which the catalog also uses on every
+definition it reloads:
+
+| Check | Message |
+| --- | --- |
+| name unused, ignoring case | `Error: table users already exists.` |
+| name ≤ 64 bytes | `Error: table name 'nnnn…' is longer than 64 bytes.` |
+| no column named twice | `Error: column 'A' is defined twice.` |
+| TEXT at least one byte wide | `Error: column 's' must be TEXT(1) or wider.` |
+| exactly one PRIMARY KEY | `Error: table t needs an INT PRIMARY KEY column.` / `Error: table t has more than one PRIMARY KEY.` |
+| the key is INT | `Error: PRIMARY KEY column 'name' must be INT.` |
+| a row fits three to a leaf | `Error: a row of table t would take 1357 bytes; at most 1356 fit.` |
+| the definition fits the catalog | `Error: the definition of table t is 1535 bytes; at most 1024 fit.` |
 
 Every message carries its category:
 
@@ -885,9 +1034,7 @@ Every message carries its category:
 | a 33-byte username | `Type error: column 'username' is TEXT(32), but the value is 33 bytes.` |
 | `… VALUES (-1, …)` | `Error: column 'id' must not be negative.` |
 | an id that's already stored | `Error: Duplicate key.` (from the executor) |
-
-> Note: the "not negative" rule applies to every `INT` column for now. It narrows to
-> the primary key once `CREATE TABLE` can declare one.
+| `CREATE TABLE t (id INT(4) PRIMARY KEY)` | `Syntax error: expected ',' or ')' near '(' at column 23.` |
 
 ---
 
@@ -897,15 +1044,19 @@ Explicit ownership is the spine of a C codebase. The rules, drawn:
 
 ```mermaid
 flowchart TD
-    main ==>|creates| schema
-    main ==>|creates| table
+    main ==>|db_open| db["Database"]
     main -.->|stack value| stmt["Statement"]
 
-    schema ==>|owns: malloc + strdup| cols["columns[] + names"]
-    table ==>|owns| pager["Pager"]
+    db ==>|owns| pager["Pager"]
     pager ==>|owns| pagesfd["page cache + open fd"]
-    table -.->|borrows| schema
+    db ==>|owns| catalog["catalog Table"]
+    db ==>|owns| tables["tables[]"]
+    tables ==>|each owns| tparts["name + Schema + CREATE TABLE text"]
+    tables -.->|borrow| pager
+    tparts ==>|Schema owns: malloc + strdup| cols["columns[] + names"]
     stmt ==>|owns: record_init| payload["Record.payload"]
+    stmt ==>|owns until executed| def["TableDefinition"]
+    def -.->|handed over by table_create| tables
     prep["prepare_statement"] ==>|owns, frees before returning| ast["Ast: names + literal text"]
 ```
 
@@ -914,11 +1065,14 @@ Legend: **thick arrow = owns/frees**, **dotted arrow = borrows or stack**.
 Lifecycle rules:
 
 - `schema_create` deep-copies the caller's column array and `strdup`s each name, so
-  the source array may be a stack literal in `main`.
-- `db_open` opens the file (via `pager_open`) and stores a **borrowed** `Schema*`.
-  For a new file it writes the header on page 0 and an empty root leaf on page 1;
-  for an existing one it validates the header and exits without writing anything
-  if the file isn't one it can read.
+  `table_definition` can build the array on the stack.
+- `db_open` opens the file (via `pager_open`). For a new file it writes the header
+  on page 0 and an empty catalog on page 1; for an existing one it validates the
+  header and every catalog entry, and exits without writing anything if the file
+  isn't one it can read.
+- A `TableDefinition` belongs to its `Statement` until `database_create_table`
+  hands its name, schema and text to the new `Table`; `statement_free` then frees
+  nothing twice, and frees everything if the table was never created.
 - New nodes get their page from `get_unused_page_num` — the page just past the end
   of the file — and are cached like any other page, zero-filled. Nothing is
   reserved until the page is fetched, so callers fetch a page before allocating the
@@ -927,15 +1081,15 @@ Lifecycle rules:
   the array moves: each page is its own allocation, so a node pointer the B-tree
   holds stays valid while it fetches other pages.
 - `db_close` is the single teardown path: it flushes every cached page, then
-  `pager_close` (closes the fd + frees the cache), then `schema_free`, then frees the
-  table. `.exit` is the only caller.
+  `pager_close` (closes the fd + frees the cache), then frees every table, the
+  catalog and the database. `.exit` is the only caller.
 - `prepare_statement` owns the syntax tree for exactly one call: the parser frees a
   partly built tree itself when it hits an error, and `prepare_statement` frees a
   complete one after binding, whether binding succeeded or not. Everything the
   executor needs is copied into the `Statement` first.
 - Each REPL iteration zero-initializes `Statement statement = {0}` and calls
-  `record_free` after execution — a no-op for `select` (NULL payload), the real free
-  for `insert`. The `Cursor` is `malloc`'d per statement and freed at the end of
+  `statement_free` after execution — a no-op for `select`, the record's free for
+  `insert`, and whatever a `CREATE TABLE` didn't hand over. The `Cursor` is `malloc`'d per statement and freed at the end of
   each execute, including on the duplicate-key path.
 
 ---
@@ -956,7 +1110,10 @@ flowchart LR
         d[executor.c]
         e[schema.c]
         f[record.c]
+        n[table_definition.c]
         g[table.c]
+        o[catalog.c]
+        p[database.c]
         m[file_header.c]
         h[pager.c]
         i[cursor.c]
@@ -1004,9 +1161,12 @@ sequenceDiagram
 
 Every case receives both binaries. The internal-split cases drive the 3-key test
 build, and first check through `.constants` that it really got that build; the
-rest drive the real `mini_sql`.
+rest drive the real `mini_sql`. Every case starts from a file that already holds
+the `users` table, created by a separate run of the binary so its output never
+mixes with the test's — except the `CREATE TABLE` cases that need an empty
+database.
 
-The 22 cases:
+The 26 cases:
 
 | Area | Cases |
 | --- | --- |
@@ -1022,7 +1182,11 @@ The 22 cases:
 | Scans | every row in key order across leaves, for four insertion orders and across a reopen, and across four leaves and deep trees; an empty table |
 | Large tables | on the real binary, 3,583 ascending rows fill a 510-key root exactly and row 3,584 splits it — the real fan-out's first internal split — with every row reachable before and after a reopen |
 | File header | a new file's magic, format version, page size and root page; a header that stays byte-identical as the table grows and across a reopen, with its reserved bytes zero; two files built from the same statements, byte-identical |
-| Refused files | a page of zeros, a file from before the header existed, a page of text, and good headers patched to format 2, 8192-byte pages, root page 0 and root page 99 — each refused with its message and a failing exit status, and left byte for byte unchanged |
+| Refused files | a page of zeros, a file from before the header existed, a page of text, and good headers patched to format 1 and format 3, 8192-byte pages, catalog root page 0 and catalog root page 99 — each refused with its message and a failing exit status, and left byte for byte unchanged |
+| Creating tables | tables of different shapes with the key in any position; negative values outside the key; duplicates caught by the key; names matched ignoring case; `.tables` and `.schema` with canonical definitions; all of it after a reopen |
+| Refused definitions | every `CREATE TABLE` check, including the row-size boundary (`TEXT(1352)` accepted with exactly 3 rows to a leaf, `TEXT(1353)` refused), malformed column definitions, and `.btree` / `.schema` / `.constants` with a missing, unknown or extra table name |
+| Many tables | three tables of different widths filled with interleaved inserts on the 3-key build, each a valid tree three or four levels deep holding exactly its rows after a reopen; then thirty more, splitting the catalog's root into an internal node, all found again in creation order |
+| Damaged catalog | a stored definition that doesn't parse, one that parses but is invalid, a catalog name that doesn't match its definition, and a root page past the end — each refused, untouched |
 
 How the suite earns its trust:
 
@@ -1068,11 +1232,17 @@ How the suite earns its trust:
 - **Sanitizers.** The B-tree stages were each run under AddressSanitizer and
   UndefinedBehaviorSanitizer, which is what surfaced the misaligned loads in the
   tutorial's node layout.
+- **Catalog mutation checks.** Skipping the "already exists" check, never writing
+  the catalog entry, taking the key from the first column, rejecting negatives in
+  every INT column again, letting the row limit slip by a byte, and loading every
+  table from the first stored definition each fail a test.
 - **Fuzzing and leak checks for the front end.** 20,000 lines of random token soup
   and byte-level mutations of valid statements ran through the sanitized binary
   without a single report, and `leaks --atExit` finds nothing after a script that
   hits every kind of error — including the partly built syntax trees freed on the
-  way out.
+  way out. A second run mixed in `CREATE TABLE` fragments: the 74 tables it managed
+  to create, some with mangled names, all loaded back from their stored definitions
+  when the file was reopened.
 - **Timeouts.** Scans follow on-disk pointers, so each test has a 10-second limit
   that turns a pointer cycle into a fast failure instead of a hang.
 
@@ -1087,8 +1257,9 @@ ctest --test-dir build --output-on-failure
 **Schema-driven, not struct-driven.** The tutorial's `Row` struct bakes the row
 layout into the compiler; `ALTER TABLE` is then impossible without changing C source.
 `mini-sql` computes the layout in `schema_create`, so a row is just bytes plus a
-ruler. Cost: a layer of indirection now. Payoff: runtime `CREATE TABLE` / `ALTER`
-later with no change to `record`, `btree`, or `executor`.
+ruler. Cost: a layer of indirection from the start. Payoff: when `CREATE TABLE`
+arrived, `record` and `btree` didn't change at all — they had never known what a
+row looked like.
 
 **Storage behind a cursor.** `execute_insert` / `execute_select` reach rows only
 through a cursor. That abstraction paid off when the table became a B-tree: the
@@ -1141,7 +1312,21 @@ a metadata edit; `DROP` becomes a flag; neither disturbs other columns' data.
 schema; the binder checks that tree against the table. Syntax errors and schema
 errors come from different layers with different information — a token's column,
 or a column's type — and the parser can read a statement about a table that
-doesn't exist yet, which the catalog will need.
+doesn't exist yet, which the catalog relies on when it reloads definitions.
+
+**Tables are described in exactly one way.** The catalog's own schema is a
+`CREATE TABLE` statement, parsed at open like any other; the catalog stores each
+table's definition as SQL and re-parses it on open; and a new `CREATE TABLE` and a
+reloaded one pass through the same `table_definition` checks. There is no second,
+binary description of a schema that could drift out of step with the first.
+
+**Store a canonical definition, not the input.** The catalog keeps SQL regenerated
+from the checked definition, so what's stored carries no comments or formatting
+and is guaranteed to parse back to the same table.
+
+**Every table has one INT primary key.** The key is what the B-tree orders rows
+by, so requiring it keeps one key model through the engine: every table gets
+lookups and range scans by key, and duplicates are caught by the tree itself.
 
 **Validate before allocate.** The binder proves the whole statement is valid before
 calling `record_init`. Early returns can't leak, and there's no half-built record to
@@ -1162,7 +1347,8 @@ NUL terminator. Bounding the print to `column->size` means `mini-sql` never had 
 
 | The tutorial | mini-sql | Why it matters |
 | --- | --- | --- |
-| A fixed `Row` struct with compile-time offsets | A runtime `Schema` computes every offset | `CREATE TABLE` / `ALTER TABLE` stay possible |
+| A fixed `Row` struct with compile-time offsets | A runtime `Schema` computes every offset | `CREATE TABLE` defines tables at runtime |
+| One table, compiled in | A catalog table listing every table, its root page and its `CREATE TABLE` text | Any number of tables in one file |
 | `insert 1 user email` split on spaces (`sscanf`, later `strtok`), with a few fixed error messages | SQL through a tokenizer, a recursive-descent parser and a binder, with errors that name the problem and its column | Text can hold spaces and quotes; `insert abc …` is an error, not id 0 |
 | Row text buffers need a `+1` for the NUL | Width-bounded printing (`%.*s`) | No struct, so the max-length-string bug never existed |
 | Packed 6-byte node header | Aligned 8-byte header, 4-byte-multiple cells | `uint32_t` loads are UBSan-clean |
@@ -1201,9 +1387,9 @@ flowchart LR
     classDef now fill:#fff2cc,stroke:#bba12a;
     classDef todo fill:#eeeeee,stroke:#999999;
 
-    class A,S1,S2 done;
-    class S3 now;
-    class S4,S5,S6 todo;
+    class A,S1,S2,S3 done;
+    class S4 now;
+    class S5,S6 todo;
 ```
 
 - **Done — the tutorial (1–14):** REPL, schema-driven rows, a file-backed pager, the
@@ -1217,14 +1403,14 @@ flowchart LR
   instead of stopping at 100 pages, and a versioned header on page 0 that refuses
   foreign, older or corrupt files cleanly. With the page limit gone, the real
   binary reaches its first 510-key internal split at 3,584 ascending rows.
-- **Next — Stage 3, catalog and `CREATE TABLE`:** the catalog is itself a B-tree
-  table holding each table's name, root page and `CREATE TABLE` text, re-parsed on
-  open. The header records the catalog's root instead of a single table's, which
-  makes it file format 2. Many tables share one file; the hardcoded `users` table
-  goes away.
-- **Stage 4 — `SELECT` column lists, typed `WHERE`, range scans:** conditions on the
-  primary key become a point lookup or a seek plus a bounded walk along the leaf
-  chain, and `EXPLAIN` shows which plan was chosen.
+- **Done — Stage 3, catalog and `CREATE TABLE`:** a catalog that is itself a
+  B-tree table, holding each table's name, root page and canonical `CREATE TABLE`
+  text, re-parsed and re-checked on open (file format 2). Any number of tables
+  share one file, each with its INT primary key in any position; the hardcoded
+  `users` table is gone.
+- **Next — Stage 4, `SELECT` column lists, typed `WHERE`, range scans:**
+  conditions on a table's primary key become a point lookup or a seek plus a
+  bounded walk along the leaf chain, and `EXPLAIN` shows which plan was chosen.
 - **Stage 5 — `DELETE`:** borrowing from and merging with siblings, collapsing the
   root, and reusing freed pages, so the tree stays balanced.
 - **Stage 6 — error audit and presentation:** every storage failure reports an error
@@ -1249,7 +1435,10 @@ mini-sql/
 │   ├── pager.h             # Pager, PAGE_SIZE, the growable page cache, page allocation
 │   ├── file_header.h       # page 0's layout, FILE_FORMAT_VERSION, header checks
 │   ├── btree.h             # node formats, search, insert/split, tree printer
-│   ├── table.h             # Table + db_open / db_close
+│   ├── table_definition.h  # TableDefinition: CREATE TABLE checks + canonical SQL
+│   ├── table.h             # Table: one B-tree, its schema and key; table_insert
+│   ├── catalog.h           # CATALOG_SQL, CatalogEntry, adding and loading entries
+│   ├── database.h          # Database + db_open / db_close, finding and creating tables
 │   ├── cursor.h            # Cursor + start/find/value/advance
 │   ├── statement.h         # Statement, PrepareResult, the binder's entry point
 │   └── executor.h          # ExecuteResult, execute_statement
@@ -1263,7 +1452,10 @@ mini-sql/
 │   ├── pager.c
 │   ├── file_header.c
 │   ├── btree.c
+│   ├── table_definition.c
 │   ├── table.c
+│   ├── catalog.c
+│   ├── database.c
 │   ├── cursor.c
 │   ├── statement.c
 │   ├── executor.c
@@ -1281,17 +1473,20 @@ This is a learning engine. Known gaps, most of them on the [roadmap](#roadmap):
 - **Memory** — the page cache never evicts, so every page a session touches stays in
   memory until `.exit`: 4 KiB per page, which for 100,000 rows inserted in order is
   a 56 MB file and 58 MB of memory at peak. Close writes every loaded page, changed
-  or not. Files over 4 GiB aren't supported (the
-  file's length is read into 32 bits), though memory runs out well before that.
+  or not. Files over 4 GiB aren't supported (the file's length is read into 32
+  bits), though memory runs out well before that.
 - **Crash safety** — pages are flushed only on a clean `.exit`; kill the process, or
   hit a fatal error, and unsaved changes are lost. No rollback journal or WAL.
-- **Older files** — files written before the header existed are refused (the header
-  is the last format change that couldn't be detected); delete and recreate them.
-  Stage 3 moves to format 2, and format-1 files will be refused the same way.
-- **A small SQL dialect** — so far `INSERT` and `SELECT *` on one hardcoded `users`
-  table, one statement per line, INT and TEXT(n) columns only, no NULLs or defaults.
-  `WHERE` and `DELETE` are on the roadmap; `UPDATE`, joins and subqueries are not.
-  The keywords are reserved, so a table or column can't be named `key` or `text`.
+- **Older files** — files from before the header existed, and format-1 files from
+  before the catalog, are refused with a message; delete and recreate them.
+- **A small SQL dialect** — `CREATE TABLE`, `INSERT` and `SELECT *`, one statement
+  per line, INT and TEXT(n) columns only, no NULLs or defaults. `WHERE` and
+  `DELETE` are on the roadmap; `UPDATE`, `DROP TABLE`, `ALTER TABLE`, joins and
+  subqueries are not. The keywords are reserved, so a table or column can't be named
+  `key` or `text`.
+- **Table limits** — a table needs exactly one INT primary key; its name can be up
+  to 64 bytes, a row up to 1,356 bytes, and its canonical definition up to 1,024.
+  The catalog is visible only through `.tables` and `.schema`, not to `SELECT`.
 - **A bytecode VM** — the binder hands the executor a ready-to-run statement; there
   is no code generator and no VDBE.
 - **Concurrent** — single-threaded, no locking.
