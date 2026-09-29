@@ -14,10 +14,11 @@ door open to `CREATE TABLE`, `ALTER TABLE`, and multiple tables without a rewrit
 
 Today it is a **persistent B+ tree** over a single table. Rows are kept sorted by
 primary key in 4 KiB leaf pages; internal pages route lookups, so finding a key
-costs one binary search per level; a full leaf splits anywhere in the tree, adding
-itself to its parent or growing a new root; and a chain of sibling pointers lets a
-scan return every row in key order.
-The pager caches pages in memory and writes them to a single database file.
+costs one binary search per level; full nodes, leaf or internal, split and cascade
+up to a new root, so the tree grows to any depth; and a chain of sibling pointers
+lets a scan return every row in key order. The pager caches pages in memory and
+writes them to a single database file. Every part of the tutorial's storage engine
+is in place.
 
 ---
 
@@ -106,13 +107,13 @@ tests. No third-party libraries.
 | **Duplicate primary keys rejected** | ✅ |
 | **Leaf splits** that grow a new internal root | ✅ |
 | **Splits below the root** that update the parent's separators and children | ✅ |
+| **Internal-node splits** that cascade up to a new root — a tree of any depth | ✅ |
 | **Scans across leaves** through a sibling-pointer chain | ✅ |
 | Input validation (syntax, negative id, over-length text) | ✅ |
 | Schema-driven row (de)serialization | ✅ |
 | Persistence to a single database file | ✅ |
 | Per-statement execution timing | ✅ |
-| Black-box test suite (15 CTest cases) | ✅ |
-| Splitting internal nodes | ⛔ next — pinned on a test build; see [limitations](#limitations--non-goals) |
+| Black-box test suite (17 CTest cases) with a B+ tree invariant checker | ✅ |
 | More than 100 pages | ⛔ the page cache is a fixed array — 699 rows in ascending order |
 | `WHERE`, `DELETE`, `UPDATE` | ⛔ |
 | `CREATE TABLE` / multiple tables | ⛔ single hardcoded schema |
@@ -416,7 +417,8 @@ keys per internal node = (4096 − 16) / 8  = 510   (511 children)
 ```
 
 The internal-node cap can be lowered at build time with
-`-DMINI_SQL_INTERNAL_NODE_MAX_KEYS=N`. The test suite uses that for a second binary
+`-DMINI_SQL_INTERNAL_NODE_MAX_KEYS=N` (no lower than 3, so a split always leaves
+both halves a key). The test suite uses that for a second binary
 capped at 3 keys, the only way to reach a full internal node in a few dozen rows;
 the page layout is identical either way.
 
@@ -496,7 +498,7 @@ flowchart TD
     E -->|no| G["update_internal_node_key:<br/>lower the old leaf's separator"]
     G --> H{is the parent full?}
     H -->|no| I["internal_node_insert:<br/>add the sibling as a child"]
-    H -->|yes| J["abort: internal split not implemented yet"]
+    H -->|yes| J["internal_node_split_and_insert:<br/>split the parent too (below)"]
 ```
 
 Cells are placed walking from the highest position down, which makes it safe to
@@ -560,8 +562,64 @@ except that its first separator reads `key 7` here, where the article's
 pointer-arithmetic bug prints `key 1`.
 
 Each child records its parent's page in bytes 4–7 of its header, which is how a
-split finds the node to update. Today every parent is page 0, the only internal
-node; the pointers start pulling their weight once internal nodes split.
+split finds the node to update.
+
+### Splitting an internal node
+
+When `internal_node_insert` finds the parent full, the parent splits too, in the
+same shape as a leaf: **split in place, then grow a new root or update the parent
+above.** With *k* keys:
+
+```mermaid
+flowchart TD
+    A["internal node full: k keys, k + 1 children,<br/>plus one child that doesn't fit"] --> B["allocate a sibling; move cells k/2 + 1 … k − 1<br/>and the right child to it in one copy"]
+    B --> C["re-point the moved children's parent pointers at the sibling"]
+    C --> D["the node keeps cells 0 … k/2 − 1;<br/>the child in cell k/2 becomes its right child"]
+    D --> E["the pending child joins whichever half owns its keys"]
+    E --> F{was the node the root?}
+    F -->|yes| G["create_new_root:<br/>copy the lower half out, re-point its children"]
+    F -->|no| H["lower the node's separator in its parent,<br/>then internal_node_insert(parent, sibling)"]
+    H -->|parent full too| A
+```
+
+Key *k/2* isn't copied anywhere. It was the maximum of the child that becomes the
+lower half's right child, so it's now the lower half's maximum, and the separator
+one level up takes over its job. On the 3-key test build, inserting 1–35 in order
+makes the root `[7 | 14 | 21]` split when row 35 arrives:
+
+```mermaid
+flowchart TD
+    R["page 0 · root<br/>key 14"]
+    I1["internal<br/>key 7"]
+    I2["internal<br/>keys 21 | 28"]
+    R --> I1
+    R --> I2
+    I1 --> A["leaf 1 – 7"]
+    I1 --> B["leaf 8 – 14"]
+    I2 --> C["leaf 15 – 21"]
+    I2 --> D["leaf 22 – 28"]
+    I2 --> E["leaf 29 – 35"]
+```
+
+Three things make deeper trees work:
+
+- **A subtree's maximum comes from its rightmost leaf.** `get_node_max_key` follows
+  right children down to a leaf. An internal node's last separator only bounds the
+  child to its left, so it's the wrong answer as soon as a separator has to describe
+  a whole subtree.
+- **Parent pointers are written wherever a child is attached:** by
+  `internal_node_insert` for the child it places, by the split for every child it
+  moves, and by `create_new_root` for both halves (and for the children of the copied
+  half, when the root was internal). A split deep in the tree follows these pointers
+  up, so one stale pointer sends an update to the wrong node.
+- **Separators are found by key range.** In a cascade, a node's rightmost leaf may
+  have just split, so its current maximum can be below the separator its parent
+  still records. `update_internal_node_key` searches for the first separator ≥ that
+  maximum, which still lands on the node.
+
+The trees match the tutorial's: the test build reproduces its published seven-leaf,
+three-level tree line for line. The route there differs; see
+[the divergences](#where-mini-sql-diverges-from-the-tutorial).
 
 ### Scan — walking the leaf chain
 
@@ -815,11 +873,11 @@ sequenceDiagram
     SH-->>CT: exit 0 (pass) / 1 (fail)
 ```
 
-Every case receives both binaries. All but one drive the real `mini_sql`; the
-internal-node boundary drives the 3-key test build, and first checks through
-`.constants` that it really got that build.
+Every case receives both binaries. The internal-split cases drive the 3-key test
+build, and first check through `.constants` that it really got that build; the
+rest drive the real `mini_sql`.
 
-The 15 cases:
+The 17 cases:
 
 | Area | Cases |
 | --- | --- |
@@ -827,27 +885,44 @@ The 15 cases:
 | Persistence | rows survive a reopen |
 | Layout | `.constants` pins every size and offset, and the real 510-key internal capacity |
 | Tree shape | one sorted leaf; a root split under four insertion orders; the split survives a reopen; inserts routed left and right after the split, including a key equal to the separator; four-leaf trees from splits below the root under ascending, descending and the tutorial's pseudorandom order, surviving a reopen |
+| Internal splits | the tutorial's published three-level tree, line for line; trees four and five levels deep from 210 rows ascending, descending and scrambled, checked against the B+ tree invariants; a deep tree reopened and split all over again through parent pointers read from disk, then reopened once more |
 | Duplicates | rejected in a single leaf, in either leaf of a split tree, and in a four-leaf tree for keys equal to a separator and just past the last one |
-| Scans | every row in key order across leaves, for four insertion orders and across a reopen, and across four leaves; an empty table |
-| Boundary | the next unimplemented step (splitting a full internal node, on the 3-key test build) stops with an explicit message |
+| Scans | every row in key order across leaves, for four insertion orders and across a reopen, and across four leaves and deep trees; an empty table |
+| Boundary | the page cache: 699 ascending rows make a valid two-level tree, and row 700, which needs a 101st page, stops with the pager's message |
 
 How the suite earns its trust:
 
 - **Exact comparison.** Tree shapes and scan results are compared line for line
   (`btree_block`, `select_rows`), because a substring check can't tell `- 1` from
   `- 10`.
+- **An invariant checker for trees too big to spell out.** `btree_check` reads a
+  printed tree and fails on the first broken B+ tree rule: keys not strictly
+  increasing, a separator that isn't the largest key on its left, a node whose size
+  disagrees with its contents or whose children and keys don't alternate, an empty
+  or overfull node, or leaves at different depths. It was itself tested against
+  doctored trees breaking each rule. It catches damage a scan can't see: a
+  misfiled subtree still returns every row through the leaf chain.
 - **Insertion orders chosen to hit each branch.** The split tests insert the same
   14 keys ascending, descending, and with the splitting key landing as the left
   half's last cell and as the right half's first — the exact boundary where an
   off-by-one would hide.
-- **Mutation checks.** The split, routing, scan and parent-update stages were each
-  verified by deliberately breaking the code and confirming the suite fails: an
-  off-by-one at the split boundary, `>` instead of `>=` when routing past a
-  separator, a missing sibling link, a skipped separator update, a new child that
-  never takes over the right-child slot, and two of the tutorial's own bugs. Its
-  split bug reproduces its exact corrupted row, `(1919251317, 14,
-  on14@example.com)`, and its `internal_node_key` bug reproduces its published
-  four-leaf tree, `key 1` and all.
+- **Mutation checks.** Every B-tree stage was verified by deliberately breaking the
+  code and confirming the suite fails:
+  - an off-by-one at the split boundary
+  - `>` instead of `>=` when routing past a separator
+  - a missing sibling link
+  - a skipped separator update
+  - a new child that never takes over the right-child slot
+  - a subtree maximum taken from the last separator
+  - a pending child sent to the wrong half
+  - parent pointers left stale by a root split, by moved children, or by an insert
+  - three of the tutorial's own bugs:
+    - its split bug reproduces the exact corrupted row, `(1919251317, 14,
+      on14@example.com)`
+    - its `internal_node_key` bug reproduces its published four-leaf tree, `key 1`
+      and all
+    - its parent-pointer overwrite misfiles a subtree under the scrambled insertion
+      order, which only the invariant checker notices
 - **Sanitizers.** The B-tree stages were each run under AddressSanitizer and
   UndefinedBehaviorSanitizer, which is what surfaced the misaligned loads in the
   tutorial's node layout.
@@ -898,6 +973,11 @@ fan-out takes thousands of rows, so the tutorial shrinks the engine's capacity t
 small value is a compile-time option used only by a second, test-only binary —
 the same approach SQLite takes with its `SQLITE_*` build options.
 
+**One shape for every split.** Leaf or internal, a split happens in place, then
+either grows a new root or lowers a separator and inserts the sibling one level up.
+The two splits differ only in how they move cells, so the parent-update logic —
+where most B-tree bugs live — exists once.
+
 **Loud boundaries over wrong answers.** While a feature is missing, the code path
 that would need it stops with a message naming it (`Need to implement …`) instead
 of returning plausible-looking garbage. Tests pin each boundary, and the stage that
@@ -929,11 +1009,14 @@ NUL terminator. Bounding the print to `column->size` means `mini-sql` never had 
 | Internal nodes capped at 3 keys "for testing" | The real 510; a separate test binary is built with 3 | The engine uses the page it has, and tests still reach a full node cheaply |
 | When the rightmost child splits, the separator update writes a key one past the node's last cell | Skipped — the rightmost child has no separator | No writes outside the node's live cells |
 | A full parent's key count is bumped before aborting | Checked before anything changes | The count never disagrees with the cells |
+| A root split creates the new root first and splits the copy; the sibling is built by re-inserting children one at a time | Split in place, then create the root; the upper half moves in one copy | One split shape; linear instead of quadratic in the node size |
+| Needs special cases for an empty internal node | The sibling is created with all its cells, so an empty internal node never exists | Fewer states to get wrong |
+| After inserting the new sibling into its parent, resets the sibling's parent pointer to the old node's | The insert that finally places the sibling sets its parent | The tutorial's pointer is wrong whenever the parent's own split separates the siblings, and a later split then misfiles a subtree |
 | Mutual recursion between two search functions that return cursors | An iterative descent in `cursor`; `btree` returns indices | `btree` stays free of cursors; no recursion |
 | As written in the articles, the duplicate check reads the root node | It reads the leaf the cursor landed in | Correct as soon as the root splits |
 | A cursor leaks on a duplicate key | Freed | No leak per rejected insert |
 | `select` after the first split prints a corrupted row until scans are implemented | It stopped with an explicit message until then | Missing features fail loudly |
-| rspec tests | bash + CTest, exact comparisons, sanitizers, mutation checks | Tests that demonstrably catch the bugs above |
+| rspec tests; the deep-tree test compares its lines as an unordered set | bash + CTest, exact comparisons, an invariant checker, sanitizers, mutation checks | Tests that demonstrably catch the bugs above |
 
 ---
 
@@ -955,27 +1038,30 @@ flowchart LR
     classDef now fill:#fff2cc,stroke:#bba12a;
     classDef todo fill:#eeeeee,stroke:#999999;
 
-    class A,B,C done;
-    class D now;
-    class E,F,G todo;
+    class A,B,C,D done;
+    class E now;
+    class F,G todo;
 ```
 
 - **Done — storage foundations (1–6):** REPL, schema-driven rows, tests, a
   file-backed pager, and the cursor abstraction.
-- **Done — B-tree (7–13):** sorted leaves with binary search, duplicate-key
-  rejection, leaf splits that grow a new root, descent through internal nodes,
-  leaf-chain scans, and splits below the root that update their parent.
-- **Next — splitting internal nodes (14):** a full internal node splits and hands a
-  new child to its own parent, recursively up to a new root, so the tree can grow
-  to any depth. At the real fan-out a root fills only after 511 leaves, beyond the
-  pager's 100-page cache, so this is exercised on the 3-key test build until the
-  cache can grow.
-- **Then — `WHERE` and `DELETE`:** a point lookup is `table_find` plus one cell; a
-  range scan is `table_find(low)` plus a walk along the leaf chain.
+- **Done — B-tree (7–14), the whole of the tutorial:** sorted leaves with binary
+  search, duplicate-key rejection, leaf splits that grow a new root, descent through
+  internal nodes, leaf-chain scans, splits below the root that update their parent,
+  and internal-node splits that cascade up to a new root.
+- **Next — `WHERE` and `DELETE`:** a point lookup is `table_find` plus one cell; a
+  range scan is `table_find(low)` plus a walk along the leaf chain. Deletion is the
+  inverse of this stage's work: merging or borrowing between siblings, shrinking
+  separators, and collapsing the root.
 - **Then — catalog + DDL:** a name→table registry, then runtime `CREATE TABLE` and the
   `ALTER TABLE ADD/DROP/RENAME COLUMN` family the schema layer was designed for.
 - **Worth doing before storing anything that matters:** a versioned file header, so
   a file written by an older format is rejected cleanly instead of misread.
+- **Worth doing before storing anything large:** a page cache that evicts or grows,
+  lifting the 100-page ceiling. That's also what lets the real binary reach an
+  internal split: a 510-key node isn't full until it has 511 children. Dropping
+  on-disk parent pointers for a path kept by the cursor, as SQLite does, would then
+  save a split from fetching every child it moves.
 
 ---
 
@@ -1020,9 +1106,9 @@ This is a learning engine. Known gaps, most of them on the [roadmap](#roadmap):
 - **Capacity** — the pager caches at most 100 pages in a fixed array, so the table
   tops out at 699 rows inserted in ascending order, and at most 1,287 (99 full
   leaves). The insert that needs a 101st page stops with `Tried to fetch page number
-  out of bounds`. Internal nodes can't split yet either, but a 510-key root outlasts the
-  page cache; the 3-key test build reaches that boundary at the 35th ascending row,
-  where it stops with `Need to implement splitting internal node`.
+  out of bounds`. Internal-node splits work, but the real binary never reaches one:
+  a 510-key root isn't full until it has 511 leaves. The 3-key test build exercises
+  them, and holds 384 ascending rows before the same page limit.
 - **Crash safety** — pages are flushed only on a clean `.exit`; kill the process, or
   hit one of the boundaries above, and unsaved changes are lost. No rollback journal
   or WAL.
