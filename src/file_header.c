@@ -4,10 +4,10 @@
 #include<stdio.h>
 #include<string.h>
 
-#define HEADER_MAGIC_SIZE       16u
-#define HEADER_VERSION_OFFSET   16u
-#define HEADER_PAGE_SIZE_OFFSET 20u
-#define HEADER_ROOT_PAGE_OFFSET 24u
+#define HEADER_MAGIC_SIZE          16u
+#define HEADER_VERSION_OFFSET      16u
+#define HEADER_PAGE_SIZE_OFFSET    20u
+#define HEADER_CATALOG_ROOT_OFFSET 24u
 
 /* Exactly 16 bytes: fifteen characters and the terminating NUL. */
 static const char HEADER_MAGIC[HEADER_MAGIC_SIZE] = "mini-sql format";
@@ -31,12 +31,12 @@ static void write_field(void* page, uint32_t offset, uint32_t value){
  * Writes a fresh header. The page is cleared first so the bytes reserved for
  * future fields are zero on disk rather than whatever the page held before.
  */
-void file_header_initialize(void* page, uint32_t root_page_num){
+void file_header_initialize(void* page, uint32_t catalog_root_page_num){
     memset(page, 0, PAGE_SIZE);
     memcpy(page, HEADER_MAGIC, HEADER_MAGIC_SIZE);
     write_field(page, HEADER_VERSION_OFFSET, FILE_FORMAT_VERSION);
     write_field(page, HEADER_PAGE_SIZE_OFFSET, PAGE_SIZE);
-    write_field(page, HEADER_ROOT_PAGE_OFFSET, root_page_num);
+    write_field(page, HEADER_CATALOG_ROOT_OFFSET, catalog_root_page_num);
 }
 
 /*
@@ -49,9 +49,9 @@ void file_header_initialize(void* page, uint32_t root_page_num){
  *   - the format version: a mini-sql file this build doesn't know how to read;
  *   - the page size: node layouts are computed from it, so any other size
  *     would misplace every cell;
- *   - the root page: it must be a page of the file, and not page 0, which is
- *     this header. A root anywhere else would send the first lookup into
- *     garbage or past the end of the file.
+ *   - the catalog root page: it must be a page of the file, and not page 0,
+ *     which is this header. A root anywhere else would send the first lookup
+ *     into garbage or past the end of the file.
  */
 bool file_header_validate(const void* page, uint32_t num_pages, const char* filename,
                           char* message, size_t message_size){
@@ -76,18 +76,18 @@ bool file_header_validate(const void* page, uint32_t num_pages, const char* file
         return false;
     }
 
-    uint32_t root_page_num = read_field(page, HEADER_ROOT_PAGE_OFFSET);
-    if(root_page_num == 0 || root_page_num >= num_pages){
+    uint32_t catalog_root_page_num = read_field(page, HEADER_CATALOG_ROOT_OFFSET);
+    if(catalog_root_page_num == 0 || catalog_root_page_num >= num_pages){
         snprintf(message, message_size,
-                 "Error: %s is corrupt: its root page %u is not a node page of the file.",
-                 filename, root_page_num);
+                 "Error: %s is corrupt: its catalog root page %u is not a node page of the file.",
+                 filename, catalog_root_page_num);
         return false;
     }
 
     return true;
 }
 
-/* The table's root page, as the header records it. */
-uint32_t file_header_root_page(const void* page){
-    return read_field(page, HEADER_ROOT_PAGE_OFFSET);
+/* The catalog's root page, as the header records it. */
+uint32_t file_header_catalog_root_page(const void* page){
+    return read_field(page, HEADER_CATALOG_ROOT_OFFSET);
 }

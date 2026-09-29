@@ -1,22 +1,30 @@
 #ifndef STATEMENT_H
 #define STATEMENT_H
 
+#include "database.h"
 #include "parser.h"
 #include "record.h"
+#include "table.h"
+#include "table_definition.h"
 
 /* The kinds of statement the engine recognizes. */
 typedef enum{
     STATEMENT_INSERT,
-    STATEMENT_SELECT
+    STATEMENT_SELECT,
+    STATEMENT_CREATE_TABLE
 }StatementType;
 
 /*
- * A prepared statement: its kind, plus the row to insert (only meaningful for
- * STATEMENT_INSERT; left zeroed for others so record_free is a safe no-op).
+ * A prepared statement: its kind, the table it acts on (INSERT and SELECT),
+ * the row to insert (INSERT), and the checked definition of a new table
+ * (CREATE TABLE). Fields a kind doesn't use stay zeroed, so statement_free is
+ * always safe.
  */
 typedef struct{
     StatementType type;
+    Table* table;                 /* borrowed from the database */
     Record record_to_insert;
+    TableDefinition definition;   /* owned until the table is created */
 }Statement;
 
 /* Outcome of turning a line of SQL into a Statement. */
@@ -27,18 +35,18 @@ typedef enum{
 }PrepareResult;
 
 /*
- * Registers the one table statements can name, and its schema. A stand-in for
- * a catalog: with a single hardcoded table the binder has nowhere else to look
- * a name up. `name` is borrowed and must outlive every prepare_statement call.
+ * Parses one line of SQL and checks it against the database: the tables it
+ * names must exist (or, for CREATE TABLE, must not), and the values must fit
+ * their columns. Fills in `statement` on success. On PREPARE_ERROR the message
+ * in `error` is ready to print, and `statement` holds nothing that needs
+ * freeing.
  */
-void statement_set_default_table(const char* name, Schema* schema);
+PrepareResult prepare_statement(Database* db, const char* sql, Statement* statement, SqlError* error);
 
 /*
- * Parses one line of SQL and checks it against the table it names, filling in
- * `statement` on success — including the row for an insert. On PREPARE_ERROR
- * the message in `error` is ready to print, and `statement` holds nothing that
- * needs freeing.
+ * Frees whatever a statement still owns: the row built for an insert, and a
+ * table definition that was never executed. Safe on any prepared statement.
  */
-PrepareResult prepare_statement(const char* sql, Statement* statement, SqlError* error);
+void statement_free(Statement* statement);
 
 #endif

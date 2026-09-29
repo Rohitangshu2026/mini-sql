@@ -6,27 +6,13 @@
 
 /*
  * The binder: it takes the parser's syntax tree and checks it against the
- * table it names, turning names into columns and literals into a row. Every
- * check runs before anything is allocated, so an error never leaves a
- * half-built record behind.
+ * database, turning table names into tables, column names into columns and
+ * literals into a row. Every check runs before anything is allocated, so an
+ * error never leaves a half-built record behind.
  */
 
 /* Longest stretch of a value an error message quotes before cutting it off. */
 #define ERROR_PREVIEW_LENGTH 32
-
-/*
- * The one table statements can name, and its schema. A file-scope stand-in for
- * a catalog: with a single hardcoded table there is nowhere else to look a
- * name up. Set once at startup.
- */
-static const char* default_table_name = NULL;
-static Schema* default_schema = NULL;
-
-/* Records the table future statements are checked against. */
-void statement_set_default_table(const char* name, Schema* schema){
-    default_table_name = name;
-    default_schema = schema;
-}
 
 /* Writes a formatted message into `error`, truncating it to fit. */
 static void set_error(SqlError* error, const char* format, ...){
@@ -46,23 +32,23 @@ static const char* preview_cut(const Literal* literal){
     return literal->length > ERROR_PREVIEW_LENGTH ? "..." : "";
 }
 
-/* Checks that `name` is a table that exists. */
-static bool bind_table(const char* name, SqlError* error){
-    if(schema_names_equal(name, default_table_name))
-        return true;
-    set_error(error, "Error: no such table: %s.", name);
-    return false;
+/* The table called `name`, or NULL with the error set if there is none. */
+static Table* bind_table(Database* db, const char* name, SqlError* error){
+    Table* table = database_find_table(db, name);
+    if(table == NULL)
+        set_error(error, "Error: no such table: %s.", name);
+    return table;
 }
 
 /*
- * Checks one value against the column it's going into. INT columns take
- * integers that fit an int32 and aren't negative (the key column can't be, and
- * for now every INT column follows the same rule). TEXT(n) columns take
+ * Checks one value against the column it's going into. INT columns take any
+ * integer that fits an int32, except that the key column's can't be negative:
+ * keys are the b-tree's unsigned 32-bit integers. TEXT(n) columns take
  * strings of at most n bytes. The kind of value is checked first, so a string
  * in an INT column is reported as the wrong type rather than as anything
  * about its contents.
  */
-static bool bind_value(const Literal* literal, const ColumnDefinition* column, SqlError* error){
+static bool bind_value(const Literal* literal, const ColumnDefinition* column, bool is_key, SqlError* error){
     if(column->type == COLUMN_INT){
         if(literal->type != LITERAL_INTEGER){
             set_error(error, "Type error: column '%s' is INT, but '%.*s%s' is text.",
@@ -74,7 +60,7 @@ static bool bind_value(const Literal* literal, const ColumnDefinition* column, S
                       preview_length(literal), literal->text, preview_cut(literal), column->name);
             return false;
         }
-        if(literal->integer < 0){
+        if(is_key && literal->integer < 0){
             set_error(error, "Error: column '%s' must not be negative.", column->name);
             return false;
         }
@@ -105,11 +91,12 @@ static bool bind_value(const Literal* literal, const ColumnDefinition* column, S
  * column, then the value count, then missing columns, then each value — so the
  * error reported is the most basic thing wrong.
  */
-static PrepareResult bind_insert(const InsertAst* insert, Statement* statement, SqlError* error){
-    if(!bind_table(insert->table_name, error))
+static PrepareResult bind_insert(Database* db, const InsertAst* insert, Statement* statement, SqlError* error){
+    Table* table = bind_table(db, insert->table_name, error);
+    if(table == NULL)
         return PREPARE_ERROR;
 
-    const Schema* schema = default_schema;
+    const Schema* schema = table->schema;
     uint32_t num_columns = schema->num_columns;
     uint32_t targets[num_columns];   /* targets[i]: the column value i goes into */
     bool listed[num_columns];
@@ -153,11 +140,13 @@ static PrepareResult bind_insert(const InsertAst* insert, Statement* statement, 
     }
 
     for(uint32_t i = 0; i < insert->num_values; ++i){
-        if(!bind_value(&insert->values[i], &schema->columns[targets[i]], error))
+        const ColumnDefinition* column = &schema->columns[targets[i]];
+        if(!bind_value(&insert->values[i], column, column->column_id == table->key_column_id, error))
             return PREPARE_ERROR;
     }
 
     statement->type = STATEMENT_INSERT;
+    statement->table = table;
     record_init(&statement->record_to_insert, schema);
     for(uint32_t i = 0; i < insert->num_values; ++i){
         const ColumnDefinition* column = &schema->columns[targets[i]];
@@ -171,10 +160,29 @@ static PrepareResult bind_insert(const InsertAst* insert, Statement* statement, 
 }
 
 /* Binds a SELECT, which for now only has to name a table that exists. */
-static PrepareResult bind_select(const SelectAst* select, Statement* statement, SqlError* error){
-    if(!bind_table(select->table_name, error))
+static PrepareResult bind_select(Database* db, const SelectAst* select, Statement* statement, SqlError* error){
+    Table* table = bind_table(db, select->table_name, error);
+    if(table == NULL)
         return PREPARE_ERROR;
     statement->type = STATEMENT_SELECT;
+    statement->table = table;
+    return PREPARE_SUCCESS;
+}
+
+/*
+ * Binds a CREATE TABLE. The one check that needs the database — that the name
+ * is free, ignoring case — comes first; everything else is the table
+ * definition's, shared with reloading tables from the catalog.
+ */
+static PrepareResult bind_create_table(Database* db, const CreateTableAst* create, Statement* statement,
+                                       SqlError* error){
+    if(database_find_table(db, create->table_name) != NULL){
+        set_error(error, "Error: table %s already exists.", create->table_name);
+        return PREPARE_ERROR;
+    }
+    if(!table_definition_from_ast(create, &statement->definition, error))
+        return PREPARE_ERROR;
+    statement->type = STATEMENT_CREATE_TABLE;
     return PREPARE_SUCCESS;
 }
 
@@ -183,7 +191,7 @@ static PrepareResult bind_select(const SelectAst* select, Statement* statement, 
  * the duration of this call: everything the executor needs is copied into the
  * Statement.
  */
-PrepareResult prepare_statement(const char* sql, Statement* statement, SqlError* error){
+PrepareResult prepare_statement(Database* db, const char* sql, Statement* statement, SqlError* error){
     Ast ast;
     if(!parse_statement(sql, &ast, error))
         return PREPARE_ERROR;
@@ -194,13 +202,22 @@ PrepareResult prepare_statement(const char* sql, Statement* statement, SqlError*
             result = PREPARE_EMPTY;
             break;
         case AST_INSERT:
-            result = bind_insert(&ast.insert, statement, error);
+            result = bind_insert(db, &ast.insert, statement, error);
             break;
         case AST_SELECT:
-            result = bind_select(&ast.select, statement, error);
+            result = bind_select(db, &ast.select, statement, error);
+            break;
+        case AST_CREATE_TABLE:
+            result = bind_create_table(db, &ast.create_table, statement, error);
             break;
     }
 
     ast_free(&ast);
     return result;
+}
+
+/* Frees an insert's row and a definition that was never turned into a table. */
+void statement_free(Statement* statement){
+    record_free(&statement->record_to_insert);
+    table_definition_free(&statement->definition);
 }

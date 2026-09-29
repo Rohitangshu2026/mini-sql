@@ -25,9 +25,27 @@ normalize() {
     sed -E -e 's/ \([0-9]+\.[0-9]+ ms\)//' -e 's/[[:space:]]+$//'
 }
 
-# run INPUT -> normalized output on stdout.
-# The binary now needs a database file; start each case from an empty one.
+# The table most tests work with. Its 291-byte rows fit 13 to a leaf, the
+# layout every tree-shape expectation below is built around.
+USERS_DDL="CREATE TABLE users (id INT PRIMARY KEY, username TEXT(32), email TEXT(255));"
+
+# fresh_db -> replaces $TESTDB with a new database holding an empty users
+# table. The table is created by a separate run of the binary, so that run's
+# output never mixes with the output a test inspects.
+fresh_db() {
+    rm -f "$TESTDB"
+    printf '%s\n.exit\n' "$USERS_DDL" | "$DB" "$TESTDB" >/dev/null
+}
+
+# run INPUT -> normalized output on stdout, starting from a fresh database
+# that already holds the users table.
 run() {
+    fresh_db
+    printf '%s' "$1" | "$DB" "$TESTDB" | normalize
+}
+
+# run_empty INPUT -> like run, but starting from a database with no tables.
+run_empty() {
     rm -f "$TESTDB"
     printf '%s' "$1" | "$DB" "$TESTDB" | normalize
 }
@@ -111,20 +129,21 @@ check_error_cases() {
 # The users table's leaf capacity (pinned by t_constants).
 LEAF_MAX_CELLS=13
 
-# btree_check OUTPUT MAX_KEYS -> checks the tree printed by .btree against the
-# B+ tree invariants and prints its height (the number of levels, leaves
-# included). Fails, naming the first broken rule, if:
+# btree_check OUTPUT MAX_KEYS [MAX_CELLS] -> checks the tree printed by .btree
+# against the B+ tree invariants and prints its height (the number of levels,
+# leaves included). MAX_CELLS is the table's leaf capacity, the users table's
+# by default. Fails, naming the first broken rule, if:
 #   - leaf keys don't strictly increase from the first leaf to the last
 #   - a separator isn't the last leaf key printed before it, i.e. the largest
 #     key in the subtree on its left
 #   - a node's printed size disagrees with what's printed under it, or an
 #     internal node doesn't alternate child, key, child ... child
-#   - a node is empty or holds more than it may (LEAF_MAX_CELLS / MAX_KEYS)
+#   - a node is empty or holds more than it may (MAX_CELLS / MAX_KEYS)
 #   - leaves sit at different depths
 # Lets a test cover a tree of any size and insertion order without spelling
 # the whole tree out.
 btree_check() {
-    btree_block "$1" | awk -v max_keys="$2" -v max_cells="$LEAF_MAX_CELLS" '
+    btree_block "$1" | awk -v max_keys="$2" -v max_cells="${3:-$LEAF_MAX_CELLS}" '
         function fail(msg) {
             printf "btree_check: %s (line %d: %s)\n", msg, NR, $0 > "/dev/stderr"
             failed = 1
@@ -369,7 +388,7 @@ t_negative_id() {
 
 t_persistence() {
     # Insert then exit (flushes to disk), reopen the SAME file, and read it back.
-    rm -f "$TESTDB"
+    fresh_db
     { inserts 1; printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
     local out
     out=$(printf 'SELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
@@ -382,7 +401,7 @@ t_constants() {
     # header, cell padded 295 -> 296) so pointer accessors aren't UB. The leaf
     # header is 16 bytes: common header, cell count, next-leaf pointer.
     local out
-    out=$(run $'.constants\n.exit\n')
+    out=$(run $'.constants users\n.exit\n')
     want "$out" "ROW_SIZE: 291" &&
     want "$out" "COMMON_NODE_HEADER_SIZE: 8" &&
     want "$out" "LEAF_NODE_HEADER_SIZE: 16" &&
@@ -396,7 +415,7 @@ t_btree_one_node() {
     # Inserted 3, 1, 2 but stored sorted: insert seeks the key's position
     # instead of appending.
     local out expected
-    out=$(run "$(inserts 3 1 2)"$'\n.btree\n.exit\n')
+    out=$(run "$(inserts 3 1 2)"$'\n.btree users\n.exit\n')
     expected=$'- leaf (size 3)\n  - 1\n  - 2\n  - 3'
     [[ "$(btree_block "$out")" == "$expected" ]]
 }
@@ -411,7 +430,7 @@ t_btree_split() {
     #                       exact left/right boundary, the likeliest off-by-one)
     local order out
     for order in "$(seq 1 14)" "$(seq 14 -1 1)" "$(seq 1 6) $(seq 8 14) 7" "$(seq 1 7) $(seq 9 14) 8"; do
-        out=$(run "$(inserts $order)"$'\n.btree\n.exit\n')
+        out=$(run "$(inserts $order)"$'\n.btree users\n.exit\n')
         [[ "$(btree_block "$out")" == "$SPLIT_TREE" ]] || return 1
     done
 }
@@ -419,10 +438,10 @@ t_btree_split() {
 t_btree_split_persists() {
     # A split leaves three pages; all must reach disk, and the root must be
     # read back as an internal node when the file is reopened.
-    rm -f "$TESTDB"
+    fresh_db
     { inserts $(seq 1 14); printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
     local out
-    out=$(printf '.btree\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    out=$(printf '.btree users\n.exit\n' | "$DB" "$TESTDB" | normalize)
     [[ "$(btree_block "$out")" == "$SPLIT_TREE" ]]
 }
 
@@ -436,7 +455,7 @@ t_btree_insert_after_split() {
     #         already lives, and be rejected as a duplicate
     #   28 -> a duplicate found in the right leaf
     local out expected
-    out=$(run "$(inserts $(seq 2 2 28) 3 15 29 1 14 28)"$'\n.btree\n.exit\n')
+    out=$(run "$(inserts $(seq 2 2 28) 3 15 29 1 14 28)"$'\n.btree users\n.exit\n')
     [[ $(grep -cF 'Error: Duplicate key.' <<<"$out") -eq 2 ]] || return 1
     expected=$(cat <<'EOF'
 - internal (size 1)
@@ -478,7 +497,7 @@ t_select_multilevel() {
     done
 
     # 20 rows fill the right leaf completely; the chain must survive a reopen.
-    rm -f "$TESTDB"
+    fresh_db
     { inserts $(seq 1 20); printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
     out=$(printf 'SELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
     [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 20))" ]]
@@ -510,7 +529,7 @@ t_btree_nonroot_split() {
     local leaves=("1-7 8-14 15-21 22-30" "1-9 10-16 17-23 24-30" "1-7 8-15 16-22 23-30")
     local i out
     for i in 0 1 2; do
-        out=$(run "$(inserts ${orders[i]})"$'\n.btree\nSELECT * FROM users;\n.exit\n')
+        out=$(run "$(inserts ${orders[i]})"$'\n.btree users\nSELECT * FROM users;\n.exit\n')
         [[ "$(btree_block "$out")" == "$(tree_over_leaves ${leaves[i]})" ]] || return 1
         [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 30))" ]] || return 1
     done
@@ -521,7 +540,7 @@ t_btree_nonroot_split() {
     # tree and every row must then survive a reopen, all five pages intact.
     out=$(run "$(inserts $(seq 1 30) 14 21 22)"$'\n.exit\n')
     [[ $(grep -cF 'Error: Duplicate key.' <<<"$out") -eq 3 ]] || return 1
-    out=$(printf '.btree\nSELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    out=$(printf '.btree users\nSELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
     [[ "$(btree_block "$out")" == "$(tree_over_leaves 1-7 8-14 15-21 22-30)" ]] &&
     [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 30))" ]]
 }
@@ -538,7 +557,7 @@ t_btree_internal_split() {
     # set), and a select must return every row in key order.
     local DB="$SMALL_FANOUT_DB" order out height
     require_small_fanout || return 1
-    out=$(run "$(inserts $CSTACK_7_LEAF_ORDER)"$'\n.btree\nSELECT * FROM users;\n.exit\n')
+    out=$(run "$(inserts $CSTACK_7_LEAF_ORDER)"$'\n.btree users\nSELECT * FROM users;\n.exit\n')
     [[ "$(btree_block "$out")" == "$CSTACK_7_LEAF_TREE" ]] || return 1
     [[ "$(select_rows "$out")" == "$(expected_rows $(printf '%s\n' $CSTACK_7_LEAF_ORDER | sort -n))" ]] || return 1
 
@@ -555,7 +574,7 @@ t_btree_internal_split() {
     # subtree. A scan still finds every row through the leaf chain; only the
     # separator check in btree_check sees the damage.
     for order in "$(seq 1 210)" "$(seq 210 -1 1)" "$(scrambled 211)"; do
-        out=$(run "$(inserts $order)"$'\n.btree\nSELECT * FROM users;\n.exit\n')
+        out=$(run "$(inserts $order)"$'\n.btree users\nSELECT * FROM users;\n.exit\n')
         height=$(btree_check "$out" 3) && (( height >= 4 )) || return 1
         [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 210))" ]] || return 1
     done
@@ -569,16 +588,16 @@ t_btree_internal_split_persists() {
     # be so after one more reopen.
     local DB="$SMALL_FANOUT_DB" out height
     require_small_fanout || return 1
-    rm -f "$TESTDB"
+    fresh_db
     { inserts $(seq 2 2 200); printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
-    out=$(printf '.btree\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    out=$(printf '.btree users\n.exit\n' | "$DB" "$TESTDB" | normalize)
     height=$(btree_check "$out" 3) && (( height >= 4 )) || return 1
 
-    out=$({ inserts $(seq 199 -2 1); printf '.btree\nSELECT * FROM users;\n.exit\n'; } | "$DB" "$TESTDB" | normalize)
+    out=$({ inserts $(seq 199 -2 1); printf '.btree users\nSELECT * FROM users;\n.exit\n'; } | "$DB" "$TESTDB" | normalize)
     btree_check "$out" 3 >/dev/null || return 1
     [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 200))" ]] || return 1
 
-    out=$(printf '.btree\nSELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    out=$(printf '.btree users\nSELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
     btree_check "$out" 3 >/dev/null &&
     [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 200))" ]]
 }
@@ -591,31 +610,33 @@ t_large_table() {
     # splits too and the tree grows a third level. Every row must be reachable,
     # and still be after a reopen.
     local out height
-    out=$(run "$(inserts $(seq 1 3583))"$'\n.btree\n.exit\n')
+    out=$(run "$(inserts $(seq 1 3583))"$'\n.btree users\n.exit\n')
     height=$(btree_check "$out" 510) && (( height == 2 )) || return 1
     want "$out" "- internal (size 510)" || return 1
 
-    out=$(run "$(inserts $(seq 1 3584))"$'\n.btree\nSELECT * FROM users;\n.exit\n')
+    out=$(run "$(inserts $(seq 1 3584))"$'\n.btree users\nSELECT * FROM users;\n.exit\n')
     height=$(btree_check "$out" 510) && (( height == 3 )) || return 1
     [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 3584))" ]] || return 1
 
-    out=$(printf '.btree\nSELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    out=$(printf '.btree users\nSELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
     height=$(btree_check "$out" 510) && (( height == 3 )) &&
     [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 3584))" ]]
 }
 
 t_file_header() {
-    # Page 0 of a new database is its header: the magic string, then format 1,
-    # 4096-byte pages and the table's root on page 1 (the fields are read in the
-    # host's byte order, like the file writes them). The header doesn't change
-    # as the table grows or across a reopen, while page 1 becomes the internal
-    # root after the first split.
+    # Page 0 of a new database is its header: the magic string, then format 2,
+    # 4096-byte pages and the catalog's root on page 1 (the fields are read in
+    # the host's byte order, like the file writes them). The first table
+    # created gets page 2 for its root. The header doesn't change as the table
+    # grows or across a reopen; the catalog stays a one-row leaf, while the
+    # users root becomes internal after the first split.
     local copy="$TESTDB.copy" script
-    rm -f "$TESTDB"
+    fresh_db
     { inserts $(seq 1 30); printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
     [[ "$(head -c 16 "$TESTDB" | tr '\0' '@')" == "mini-sql format@" ]] || return 1
-    [[ "$(od -An -tu4 -j16 -N12 "$TESTDB" | xargs)" == "1 4096 1" ]] || return 1
-    [[ "$(od -An -tu1 -j4096 -N2 "$TESTDB" | xargs)" == "0 1" ]] || return 1   # internal, root
+    [[ "$(od -An -tu4 -j16 -N12 "$TESTDB" | xargs)" == "2 4096 1" ]] || return 1
+    [[ "$(od -An -tu1 -j4096 -N2 "$TESTDB" | xargs)" == "1 1" ]] || return 1   # catalog: leaf, root
+    [[ "$(od -An -tu1 -j8192 -N2 "$TESTDB" | xargs)" == "0 1" ]] || return 1   # users: internal, root
 
     # The rest of page 0 is reserved for fields later formats add, which will
     # read an old file's zeros as "not set", so it must be zero.
@@ -632,10 +653,10 @@ t_file_header() {
     # happens to be zeroed anyway, so this check alone can't tell calloc from
     # malloc there; it pins the determinism the zeroing guarantees everywhere.
     script="$(printf 'SELECT * FORM users\nINSERT INTO users VALUES (1, 2, 3)\n%.0s' $(seq 1 50))"$'\n'"$(inserts $(scrambled 211))"$'\n.exit\n'
-    rm -f "$TESTDB"
+    fresh_db
     printf '%s' "$script" | "$DB" "$TESTDB" >/dev/null
     cp "$TESTDB" "$copy"
-    rm -f "$TESTDB"
+    fresh_db
     printf '%s' "$script" | "$DB" "$TESTDB" >/dev/null
     cmp -s "$TESTDB" "$copy"
     local same=$?
@@ -680,21 +701,25 @@ t_file_rejects_foreign() {
     expect_refusal "$not_ours" || return 1
 
     make_good_file() {
-        rm -f "$TESTDB"
+        fresh_db
         { inserts 1; printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
     }
 
-    make_good_file; patch_bytes 16 '\002\000\000\000'
-    expect_refusal "Error: $TESTDB uses file format 2; this build reads format 1." || return 1
+    # A format-1 file (from before the catalog) and one from a future format.
+    make_good_file; patch_bytes 16 '\001\000\000\000'
+    expect_refusal "Error: $TESTDB uses file format 1; this build reads format 2." || return 1
+
+    make_good_file; patch_bytes 16 '\003\000\000\000'
+    expect_refusal "Error: $TESTDB uses file format 3; this build reads format 2." || return 1
 
     make_good_file; patch_bytes 20 '\000\040\000\000'
     expect_refusal "Error: $TESTDB uses 8192-byte pages; this build uses 4096." || return 1
 
     make_good_file; patch_bytes 24 '\000\000\000\000'
-    expect_refusal "Error: $TESTDB is corrupt: its root page 0 is not a node page of the file." || return 1
+    expect_refusal "Error: $TESTDB is corrupt: its catalog root page 0 is not a node page of the file." || return 1
 
     make_good_file; patch_bytes 24 '\143\000\000\000'
-    expect_refusal "Error: $TESTDB is corrupt: its root page 99 is not a node page of the file." || return 1
+    expect_refusal "Error: $TESTDB is corrupt: its catalog root page 99 is not a node page of the file." || return 1
 
     # A length that isn't a whole number of pages is caught before the header
     # is even read.
@@ -723,11 +748,11 @@ t_sql_syntax_errors() {
         "SELECT * FROM users @" \
         "Syntax error: unrecognized character '@' at column 21." \
         "UPDATE users SET id = 1" \
-        "Syntax error: expected INSERT or SELECT near 'UPDATE' at column 1." \
+        "Syntax error: expected INSERT, SELECT or CREATE near 'UPDATE' at column 1." \
         "insert abc bob bob@x.com" \
         "Syntax error: expected INTO near 'abc' at column 8." \
         "insertfoo 3 dave d@x.com" \
-        "Syntax error: expected INSERT or SELECT near 'insertfoo' at column 1." \
+        "Syntax error: expected INSERT, SELECT or CREATE near 'insertfoo' at column 1." \
         "SELECT * FROM users junk" \
         "Syntax error: expected end of statement near 'junk' at column 21." \
         "select * from nowhere where junk" \
@@ -839,6 +864,212 @@ EOF
     [[ "$(select_rows "$out")" == "$(expected_rows 1)" ]]
 }
 
+t_create_table() {
+    # Tables of any shape can be created and used side by side: the primary
+    # key orders the rows and catches duplicates wherever it sits among the
+    # columns, INT columns other than the key take negative values, and names
+    # keep their case while matching without it. .tables lists the tables in
+    # creation order and .schema prints each canonical definition — comments
+    # and spacing gone, keywords in upper case. All of it survives a reopen,
+    # which rebuilds every table by re-parsing its stored definition.
+    local script expected out
+    IFS= read -r -d '' script <<'EOF'
+CREATE TABLE orders (total INT, id INT PRIMARY KEY, note TEXT(40));
+create   table Notes (body text(1), n int primary key) -- a comment
+INSERT INTO orders VALUES (-5, 7, 'first');
+INSERT INTO orders (note, id, total) VALUES ('second', 3, -2147483648);
+INSERT INTO orders VALUES (1, 7, 'same key');
+INSERT INTO notes VALUES ('x', 1);
+.tables
+.schema
+.schema NOTES
+.exit
+EOF
+    read -r -d '' expected <<'EOF'
+db > Executed.
+db > Executed.
+db > Executed.
+db > Executed.
+db > Error: Duplicate key.
+db > Executed.
+db > orders
+Notes
+db > CREATE TABLE orders (total INT, id INT PRIMARY KEY, note TEXT(40));
+CREATE TABLE Notes (body TEXT(1), n INT PRIMARY KEY);
+db > CREATE TABLE Notes (body TEXT(1), n INT PRIMARY KEY);
+db >
+EOF
+    out=$(run_empty "$script")
+    [[ "$out" == "$expected" ]] || return 1
+
+    read -r -d '' expected <<'EOF'
+db > (-2147483648, 3, second)
+(-5, 7, first)
+Executed.
+db > (x, 1)
+Executed.
+db > orders
+Notes
+db >
+EOF
+    out=$(printf 'SELECT * FROM orders;\nSELECT * FROM notes;\n.tables\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    [[ "$out" == "$expected" ]]
+}
+
+t_create_table_errors() {
+    # Every way a definition can be refused, each with exactly its message and
+    # none of them creating a table: a name that's taken (ignoring case) or too
+    # long, a repeated column, a zero width, a missing, doubled or TEXT primary
+    # key, a row too wide to fit three to a leaf (one byte over, and far over),
+    # a definition too long for the catalog, and malformed syntax.
+    local long cols
+    long=$(printf 'n%.0s' $(seq 1 65))
+    cols=$(for i in $(seq 1 30); do printf ', c%02d_%s INT' "$i" "$(printf 'x%.0s' $(seq 1 40))"; done)
+    check_error_cases \
+        "CREATE TABLE users (id INT PRIMARY KEY)" \
+        "Error: table users already exists." \
+        "CREATE TABLE USERS (id INT PRIMARY KEY)" \
+        "Error: table USERS already exists." \
+        "CREATE TABLE $long (id INT PRIMARY KEY)" \
+        "Error: table name '$(printf 'n%.0s' $(seq 1 32))...' is longer than 64 bytes." \
+        "CREATE TABLE t (a INT PRIMARY KEY, A INT)" \
+        "Error: column 'A' is defined twice." \
+        "CREATE TABLE t (id INT PRIMARY KEY, s TEXT(0))" \
+        "Error: column 's' must be TEXT(1) or wider." \
+        "CREATE TABLE t (a INT, b TEXT(5))" \
+        "Error: table t needs an INT PRIMARY KEY column." \
+        "CREATE TABLE t (a INT PRIMARY KEY, b INT PRIMARY KEY)" \
+        "Error: table t has more than one PRIMARY KEY." \
+        "CREATE TABLE t (name TEXT(10) PRIMARY KEY)" \
+        "Error: PRIMARY KEY column 'name' must be INT." \
+        "CREATE TABLE t (id INT PRIMARY KEY, s TEXT(1353))" \
+        "Error: a row of table t would take 1357 bytes; at most 1356 fit." \
+        "CREATE TABLE t (id INT PRIMARY KEY, s TEXT(99999999999999999999))" \
+        "Error: a row of table t would be wider than 1356 bytes, the most that fit." \
+        "CREATE TABLE t (id INT PRIMARY KEY$cols)" \
+        "Error: the definition of table t is $(( ${#cols} + 35 )) bytes; at most 1024 fit." \
+        "CREATE TABLE t (id INT(4) PRIMARY KEY)" \
+        "Syntax error: expected ',' or ')' near '(' at column 23." \
+        "CREATE TABLE t (key INT PRIMARY KEY)" \
+        "Syntax error: expected a column name near 'key' at column 17." \
+        "CREATE TABLE t (id INT PRIMARY)" \
+        "Syntax error: expected KEY near ')' at column 31." \
+        "CREATE TABLE t (id BLOB)" \
+        "Syntax error: expected INT or TEXT near 'BLOB' at column 20." \
+        "CREATE TABLE t (s TEXT)" \
+        "Syntax error: expected '(' near ')' at column 23." \
+        "CREATE t (id INT PRIMARY KEY)" \
+        "Syntax error: expected TABLE near 't' at column 8." || return 1
+
+    # One byte narrower is accepted, and leaves exactly three rows to a leaf.
+    # The meta-commands report a missing or unknown table and extra words,
+    # and only the tables actually created are listed.
+    local expected out
+    read -r -d '' expected <<'EOF'
+db > Executed.
+db > LEAF_NODE_MAX_CELLS: 3
+db > Usage: .btree TABLE
+db > Error: no such table: nope.
+db > Error: no such table: nope.
+db > Usage: .constants [TABLE]
+db > Usage: .schema [TABLE]
+db > users
+wide
+db >
+EOF
+    out=$(run $'CREATE TABLE wide (id INT PRIMARY KEY, s TEXT(1352));\n.constants wide\n.btree\n.btree nope\n.schema nope\n.constants a b\n.schema a b\n.tables\n.exit\n' \
+          | awk '/^db > Constants:$/ { printf "db > "; next } /^[A-Z_]+: [0-9]+$/ && !/^LEAF_NODE_MAX_CELLS/ { next } { print }')
+    [[ "$out" == "$expected" ]]
+}
+
+# rows_text_first PREFIX ID... -> the select output for rows (PREFIX<id>, id)
+# of a table whose text column comes first
+rows_text_first() {
+    local prefix=$1 id
+    shift
+    for id in "$@"; do
+        printf '(%s%s, %s)\n' "$prefix" "$id" "$id"
+    done
+}
+
+t_many_tables() {
+    # Tables share one file and one page cache: three tables of different row
+    # widths, filled with interleaved inserts, split in pages that interleave
+    # through the file. On the 3-key build each tree grows internal levels,
+    # and each must stay a valid B+ tree holding exactly its own rows, across
+    # a reopen. Then thirty more tables fill the catalog past a leaf's three
+    # rows, so the catalog itself splits and grows internal nodes, and a reopen
+    # must find every table, in creation order, with its row.
+    local DB="$SMALL_FANOUT_DB" script out id i order height
+    require_small_fanout || return 1
+    order=$(scrambled 151)
+    script="CREATE TABLE notes (body TEXT(200), k INT PRIMARY KEY);"$'\n'
+    script+="CREATE TABLE blobs (k INT PRIMARY KEY, blob TEXT(600));"$'\n'
+    for id in $order; do
+        script+="INSERT INTO users VALUES ($id, 'user$id', 'person$id@example.com');"$'\n'
+        script+="INSERT INTO notes VALUES ('n$id', $id);"$'\n'
+        script+="INSERT INTO blobs VALUES ($id, 'b$id');"$'\n'
+    done
+    out=$(run "$script.exit"$'\n')
+    [[ -z "$(error_lines "$out")" ]] || return 1
+
+    # Leaves hold 13 users rows, 19 notes rows and 6 blobs rows.
+    out=$(printf '.btree users\nSELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    height=$(btree_check "$out" 3) && (( height >= 3 )) || return 1
+    [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 150))" ]] || return 1
+    out=$(printf '.btree notes\nSELECT * FROM notes;\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    height=$(btree_check "$out" 3 19) && (( height >= 3 )) || return 1
+    [[ "$(sed -nE 's/^(db > )?(\(n[0-9]+, [0-9]+\))$/\2/p' <<<"$out")" == "$(rows_text_first n $(seq 1 150))" ]] || return 1
+    out=$(printf '.btree blobs\nSELECT * FROM blobs;\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    height=$(btree_check "$out" 3 6) && (( height >= 3 )) || return 1
+    [[ "$(sed -nE 's/^(db > )?(\([0-9]+, b[0-9]+\))$/\2/p' <<<"$out")" == "$(for id in $(seq 1 150); do printf '(%s, b%s)\n' "$id" "$id"; done)" ]] || return 1
+
+    # Three tables fit one catalog leaf; thirty more must split it, turning
+    # the catalog's root on page 1 into an internal node (type byte 0).
+    [[ "$(od -An -tu1 -j4096 -N1 "$TESTDB" | xargs)" == 1 ]] || return 1
+    script=""
+    for i in $(seq 1 30); do
+        script+="CREATE TABLE t$i (id INT PRIMARY KEY);"$'\n'"INSERT INTO t$i VALUES ($i);"$'\n'
+    done
+    out=$(printf '%s.exit\n' "$script" | "$DB" "$TESTDB" | normalize)
+    [[ -z "$(error_lines "$out")" ]] || return 1
+    [[ "$(od -An -tu1 -j4096 -N1 "$TESTDB" | xargs)" == 0 ]] || return 1
+
+    script=".tables"$'\n'
+    for i in $(seq 1 30); do
+        script+="SELECT * FROM t$i;"$'\n'
+    done
+    out=$(printf '%s.exit\n' "$script" | "$DB" "$TESTDB" | normalize)
+    [[ "$(sed -n '1,/^db > (/p' <<<"$out" | sed '$d' | sed 's/^db > //')" == "$(printf '%s\n' users notes blobs $(for i in $(seq 1 30); do echo "t$i"; done))" ]] || return 1
+    [[ "$(sed -nE 's/^(db > )?\(([0-9]+)\)$/\2/p' <<<"$out")" == "$(seq 1 30)" ]]
+}
+
+t_catalog_corrupt() {
+    # The catalog is checked as it's loaded, and a file whose catalog is
+    # damaged is refused, untouched. In a new database the catalog's first row
+    # sits at the start of page 1: key, then the row's id (byte 4116), name
+    # (4120), root page (4184) and definition text (4188).
+    fresh_db
+    { inserts 1; printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
+    local good="$TESTDB.good"
+    cp "$TESTDB" "$good"
+
+    patch_bytes 4189 'X'                       # CREATE -> CXEATE
+    expect_refusal "Error: $TESTDB is corrupt: the stored definition of table users doesn't parse." || { rm -f "$good"; return 1; }
+
+    cp "$good" "$TESTDB"; patch_bytes 4242 '00'   # username TEXT(32) -> TEXT(00)
+    expect_refusal "Error: $TESTDB is corrupt: the stored definition of table users is invalid." || { rm -f "$good"; return 1; }
+
+    cp "$good" "$TESTDB"; patch_bytes 4120 'x'    # name users -> xsers
+    expect_refusal "Error: $TESTDB is corrupt: the catalog lists table xsers, but its definition is for users." || { rm -f "$good"; return 1; }
+
+    cp "$good" "$TESTDB"; patch_bytes 4184 '\143\000\000\000'   # root page 99
+    expect_refusal "Error: $TESTDB is corrupt: table users has root page 99, which is not a node page of the file."
+    local refused=$?
+    rm -f "$good"
+    return "$refused"
+}
+
 t_duplicate_key() {
     # The second insert of id 1 must be rejected, leaving exactly one row.
     local out
@@ -847,7 +1078,7 @@ t_duplicate_key() {
     [[ $(grep -cF '(1, user1, person1@example.com)' <<<"$out") -eq 1 ]]
 }
 
-ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split select_multilevel select_empty btree_nonroot_split btree_internal_split btree_internal_split_persists large_table file_header file_rejects_foreign sql_syntax_errors sql_binding_errors sql_lexical)
+ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split select_multilevel select_empty btree_nonroot_split btree_internal_split btree_internal_split_persists large_table file_header file_rejects_foreign sql_syntax_errors sql_binding_errors sql_lexical create_table create_table_errors many_tables catalog_corrupt)
 
 run_one() {
     if "t_$1"; then

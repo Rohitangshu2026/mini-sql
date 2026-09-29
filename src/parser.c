@@ -8,11 +8,13 @@
 /*
  * Grammar, one function per rule:
  *
- *   statement := [ insert | select ] [ ';' ] END
- *   insert    := INSERT INTO name [ '(' name { ',' name } ')' ]
- *                VALUES '(' literal { ',' literal } ')'
- *   select    := SELECT '*' FROM name
- *   literal   := [ '-' ] INTEGER | STRING
+ *   statement  := [ insert | select | create ] [ ';' ] END
+ *   insert     := INSERT INTO name [ '(' name { ',' name } ')' ]
+ *                 VALUES '(' literal { ',' literal } ')'
+ *   select     := SELECT '*' FROM name
+ *   create     := CREATE TABLE name '(' column_def { ',' column_def } ')'
+ *   column_def := name ( INT | TEXT '(' INTEGER ')' ) [ PRIMARY KEY ]
+ *   literal    := [ '-' ] INTEGER | STRING
  */
 
 /* Longest stretch of a token an error message quotes before cutting it off. */
@@ -261,7 +263,82 @@ static bool parse_select(Parser* parser, SelectAst* select){
 }
 
 /*
- * statement := [ insert | select ] [ ';' ] END
+ * column_def := name ( INT | TEXT '(' INTEGER ')' ) [ PRIMARY KEY ]
+ *
+ * Only the shape is checked here. Whether the width is sensible, or the table
+ * has exactly one key, is the table definition's business, which can say so
+ * in terms of the table rather than of tokens. The column is zeroed first, so
+ * after a failure its name is either owned or NULL and the caller can free it
+ * either way.
+ */
+static bool parse_column_def(Parser* parser, ColumnAst* column){
+    memset(column, 0, sizeof(ColumnAst));
+    if(!parse_name(parser, &column->name, "a column name"))
+        return false;
+
+    if(match(parser, TOKEN_INT))
+        column->type = AST_TYPE_INT;
+    else if(match(parser, TOKEN_TEXT)){
+        column->type = AST_TYPE_TEXT;
+        if(!expect(parser, TOKEN_LEFT_PAREN, NULL))
+            return false;
+        if(!check(parser, TOKEN_INTEGER)){
+            fail_expected(parser, "a width");
+            return false;
+        }
+        column->width = parser->current.integer;
+        column->width_out_of_range = parser->current.out_of_range;
+        advance(parser);
+        if(!expect(parser, TOKEN_RIGHT_PAREN, NULL))
+            return false;
+    }
+    else{
+        fail_expected(parser, "INT or TEXT");
+        return false;
+    }
+
+    if(match(parser, TOKEN_PRIMARY)){
+        if(!expect(parser, TOKEN_KEY, NULL))
+            return false;
+        column->primary_key = true;
+    }
+    return true;
+}
+
+/*
+ * create := CREATE TABLE name '(' column_def { ',' column_def } ')'
+ *
+ * A column that fails partway may already own its name, so it's freed here
+ * before returning; the count only covers columns parsed in full.
+ */
+static bool parse_create(Parser* parser, CreateTableAst* create){
+    advance(parser);   /* CREATE */
+    if(!expect(parser, TOKEN_TABLE, NULL))
+        return false;
+    if(!parse_name(parser, &create->table_name, "a table name"))
+        return false;
+    if(!expect(parser, TOKEN_LEFT_PAREN, NULL))
+        return false;
+
+    uint32_t capacity = 4;
+    create->columns = malloc(capacity * sizeof(ColumnAst));
+    do{
+        if(create->num_columns == capacity){
+            capacity *= 2;
+            create->columns = realloc(create->columns, capacity * sizeof(ColumnAst));
+        }
+        if(!parse_column_def(parser, &create->columns[create->num_columns])){
+            free(create->columns[create->num_columns].name);
+            return false;
+        }
+        create->num_columns++;
+    }while(match(parser, TOKEN_COMMA));
+
+    return expect(parser, TOKEN_RIGHT_PAREN, "',' or ')'");
+}
+
+/*
+ * statement := [ insert | select | create ] [ ';' ] END
  *
  * Dispatches on the first token, then requires the line to end, allowing one
  * optional ';' first. Anything after the statement — a second statement, or a
@@ -287,8 +364,12 @@ bool parse_statement(const char* sql, Ast* ast, SqlError* error){
         ast->kind = AST_SELECT;
         parse_select(&parser, &ast->select);
     }
+    else if(check(&parser, TOKEN_CREATE)){
+        ast->kind = AST_CREATE_TABLE;
+        parse_create(&parser, &ast->create_table);
+    }
     else if(!check(&parser, TOKEN_SEMICOLON) && !check(&parser, TOKEN_END))
-        fail_expected(&parser, "INSERT or SELECT");
+        fail_expected(&parser, "INSERT, SELECT or CREATE");
 
     if(!parser.failed){
         match(&parser, TOKEN_SEMICOLON);
@@ -321,6 +402,12 @@ void ast_free(Ast* ast){
             break;
         case AST_SELECT:
             free(ast->select.table_name);
+            break;
+        case AST_CREATE_TABLE:
+            free(ast->create_table.table_name);
+            for(uint32_t i = 0; i < ast->create_table.num_columns; ++i)
+                free(ast->create_table.columns[i].name);
+            free(ast->create_table.columns);
             break;
         case AST_EMPTY:
             break;

@@ -21,7 +21,10 @@ set(MINI_SQL_SOURCES
     src/executor.c
     src/schema.c
     src/record.c
+    src/table_definition.c
     src/table.c
+    src/catalog.c
+    src/database.c
     src/file_header.c
     src/pager.c
     src/cursor.c
@@ -75,6 +78,10 @@ set(MINI_SQL_TESTS
     sql_syntax_errors
     sql_binding_errors
     sql_lexical
+    create_table
+    create_table_errors
+    many_tables
+    catalog_corrupt
 )
 foreach(t ${MINI_SQL_TESTS})
     add_test(

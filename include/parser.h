@@ -45,11 +45,38 @@ typedef struct{
     char* table_name;       /* heap-owned */
 }SelectAst;
 
+/* A column's declared type, as written: INT, or TEXT with a width. */
+typedef enum{
+    AST_TYPE_INT,
+    AST_TYPE_TEXT
+}ColumnTypeAst;
+
+/*
+ * One column of a CREATE TABLE: its name, type and whether it's the primary
+ * key. A TEXT width is kept exactly as written, flag included, so a width too
+ * large to hold is reported as too wide rather than wrapping.
+ */
+typedef struct{
+    char* name;             /* heap-owned */
+    ColumnTypeAst type;
+    int64_t width;          /* AST_TYPE_TEXT: the declared width, unless out_of_range */
+    bool width_out_of_range;
+    bool primary_key;
+}ColumnAst;
+
+/* CREATE TABLE table (column type [PRIMARY KEY], ...) */
+typedef struct{
+    char* table_name;       /* heap-owned */
+    ColumnAst* columns;     /* heap-owned */
+    uint32_t num_columns;
+}CreateTableAst;
+
 /* Which statement a line holds. AST_EMPTY is a blank line or a lone ';'. */
 typedef enum{
     AST_EMPTY,
     AST_INSERT,
-    AST_SELECT
+    AST_SELECT,
+    AST_CREATE_TABLE
 }AstKind;
 
 /* A parsed statement: its kind, and the node for that kind. */
@@ -58,6 +85,7 @@ typedef struct{
     union{
         InsertAst insert;
         SelectAst select;
+        CreateTableAst create_table;
     };
 }Ast;
 

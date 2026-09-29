@@ -1,75 +1,70 @@
 #include "table.h"
 #include "btree.h"
-#include "file_header.h"
+#include "cursor.h"
 
-#include<stdio.h>
 #include<stdlib.h>
 
-/* The page a new database puts its table's root on: the first after the header. */
-#define NEW_ROOT_PAGE_NUM 1u
-
 /*
- * Opens a connection to the database file and binds it to `schema`.
- *
- * A brand-new file (num_pages == 0) gets its header on page 0 and an empty
- * root leaf on page 1, marked as the root, which the split relies on to
- * recognize it. The two pages are fetched in order, since each new page must
- * be the next one after the end of the file.
- *
- * An existing file must prove it's a database this build can read before
- * anything else happens: its header is validated, and on failure the message
- * is printed and the process exits without writing a single byte, so a file
- * that isn't ours — or is from an older build — is left exactly as it was.
- * Otherwise the root page comes from the header. It never changes afterwards:
- * a root split keeps the root on its page by moving the old contents out.
+ * Builds a table around a definition, moving its heap-owned parts over and
+ * clearing them in the definition so they can't be freed twice.
  */
-Table* db_open(const char* filename, Schema* schema){
-    Pager* pager = pager_open(filename);
-
+Table* table_create(Pager* pager, uint32_t root_page_num, TableDefinition* definition){
     Table* table = malloc(sizeof(Table));
+    table->name = definition->name;
+    table->schema = definition->schema;
+    table->key_column_id = definition->key_column_id;
+    table->root_page_num = root_page_num;
+    table->sql = definition->sql;
     table->pager = pager;
-    table->schema = schema;
 
-    if(pager->num_pages == 0){
-        void* header = pager_get_page(pager, 0);
-        file_header_initialize(header, NEW_ROOT_PAGE_NUM);
-
-        void* root_node = pager_get_page(pager, NEW_ROOT_PAGE_NUM);
-        initialize_leaf_node(root_node);
-        set_node_root(root_node, true);
-
-        table->root_page_num = NEW_ROOT_PAGE_NUM;
-        return table;
-    }
-
-    void* header = pager_get_page(pager, 0);
-    char message[512];
-    if(!file_header_validate(header, pager->num_pages, filename, message, sizeof(message))){
-        printf("%s\n", message);
-        exit(EXIT_FAILURE);
-    }
-    table->root_page_num = file_header_root_page(header);
-
+    definition->name = NULL;
+    definition->schema = NULL;
+    definition->sql = NULL;
     return table;
 }
 
 /*
- * Closes the connection: flush every resident page to disk, then hand the pager
- * off to be closed and freed. This is also where the borrowed schema is freed,
- * since db_close is the one place that owns tearing the whole connection down.
+ * Inserts a row at its sorted position.
+ *
+ * The key column supplies the key, and table_find resolves the leaf and cell
+ * where that key belongs. The duplicate check reads that leaf — the one the
+ * cursor landed in — rather than the root: once the root has split, the root
+ * is an internal node and no longer the leaf that holds the key.
+ *
+ * Because table_find returns an insertion point for a key that isn't present,
+ * a cursor landing on an existing cell is the signal to inspect it: if the key
+ * there matches, the key is already taken and the insert is refused. The
+ * bounds check matters — the cursor can legitimately sit one past the last
+ * cell, and reading a key there would be off the end of the live cells.
+ *
+ * There is no capacity check: a full leaf is split inside leaf_node_insert.
  */
-void db_close(Table* table){
-    Pager* pager = table->pager;
+bool table_insert(Table* table, const Record* record){
+    uint32_t key = (uint32_t)record_get_int(record, table->schema, table->key_column_id);
 
-    for(uint32_t i = 0; i < pager->num_pages; ++i){
-        if(pager->pages[i] == NULL)
-            continue;
-        pager_flush(pager, i);
-        free(pager->pages[i]);
-        pager->pages[i] = NULL;
+    Cursor* cursor = table_find(table, key);
+    void* leaf = pager_get_page(table->pager, cursor->page_num);
+    uint32_t num_cells = *leaf_node_num_cells(leaf);
+
+    if(cursor->cell_num < num_cells){
+        uint32_t key_at_index = *leaf_node_key(leaf, cursor->cell_num, table->schema);
+        if(key_at_index == key){
+            free(cursor);
+            return false;
+        }
     }
 
-    pager_close(pager);
+    leaf_node_insert(table->pager, cursor->page_num, cursor->cell_num, key, record, table->schema);
+    free(cursor);
+    return true;
+}
+
+/* Frees the table's name, schema and text, then the table itself. */
+void table_free(Table* table){
+    if(table == NULL)
+        return;
+    free(table->name);
     schema_free(table->schema);
+    free(table->sql);
     free(table);
 }

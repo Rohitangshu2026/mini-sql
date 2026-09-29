@@ -44,6 +44,9 @@ void set_node_root(void* node, bool is_root);
 /* Maximum cells a leaf can hold, given the schema's row size. */
 uint32_t leaf_node_max_cells(const Schema* schema);
 
+/* The widest row, in bytes, that still lets a leaf hold `min_cells` cells. */
+uint32_t leaf_node_max_row_size(uint32_t min_cells);
+
 /* Pointer to the leaf's cell-count field. */
 uint32_t* leaf_node_num_cells(void* node);
 
@@ -109,7 +112,10 @@ uint32_t* internal_node_key(void* node, uint32_t key_num);
  */
 uint32_t internal_node_find_child(void* node, uint32_t key);
 
-/* Prints the layout constants (used by the .constants meta command). */
+/*
+ * Prints the layout constants (used by the .constants meta command): those
+ * shared by every table, plus the row-dependent ones when `schema` isn't NULL.
+ */
 void print_constants(const Schema* schema);
 
 /*

@@ -150,6 +150,17 @@ uint32_t leaf_node_max_cells(const Schema* schema){
     return (PAGE_SIZE - LEAF_NODE_HEADER_SIZE) / leaf_node_cell_size(schema);
 }
 
+/*
+ * The widest row for which a leaf still holds `min_cells` cells: the space for
+ * cells split `min_cells` ways, rounded down to the 4-byte cell alignment, less
+ * the key. Row-size limits are derived from this rather than restated, so they
+ * can't drift from the actual node layout.
+ */
+uint32_t leaf_node_max_row_size(uint32_t min_cells){
+    uint32_t cell_size = ((PAGE_SIZE - LEAF_NODE_HEADER_SIZE) / min_cells) & ~3u;
+    return cell_size - LEAF_NODE_KEY_SIZE;
+}
+
 /* Pointer to the leaf's cell-count field, for reading or writing. */
 uint32_t* leaf_node_num_cells(void* node){
     return (uint32_t*)((char*)node + LEAF_NODE_NUM_CELLS_OFFSET);
@@ -691,15 +702,20 @@ void leaf_node_insert(Pager* pager, uint32_t page_num, uint32_t cell_num, uint32
 /*
  * Prints the sizes that define the on-page layout. Handy for eyeballing how
  * many rows fit in a node and as a regression guard (a test pins these values,
- * so an accidental layout change is caught immediately).
+ * so an accidental layout change is caught immediately). The node headers and
+ * internal-node capacity are the same for every table; the row, cell and leaf
+ * capacity depend on a table's schema and are printed only when one is given.
  */
 void print_constants(const Schema* schema){
-    printf("ROW_SIZE: %u\n", schema->row_size);
+    if(schema != NULL)
+        printf("ROW_SIZE: %u\n", schema->row_size);
     printf("COMMON_NODE_HEADER_SIZE: %u\n", COMMON_NODE_HEADER_SIZE);
     printf("LEAF_NODE_HEADER_SIZE: %u\n", LEAF_NODE_HEADER_SIZE);
-    printf("LEAF_NODE_CELL_SIZE: %u\n", leaf_node_cell_size(schema));
+    if(schema != NULL)
+        printf("LEAF_NODE_CELL_SIZE: %u\n", leaf_node_cell_size(schema));
     printf("LEAF_NODE_SPACE_FOR_CELLS: %u\n", PAGE_SIZE - LEAF_NODE_HEADER_SIZE);
-    printf("LEAF_NODE_MAX_CELLS: %u\n", leaf_node_max_cells(schema));
+    if(schema != NULL)
+        printf("LEAF_NODE_MAX_CELLS: %u\n", leaf_node_max_cells(schema));
     printf("INTERNAL_NODE_MAX_KEYS: %u\n", internal_node_max_keys());
 }
 
