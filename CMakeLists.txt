@@ -64,7 +64,9 @@ set(MINI_SQL_TESTS
     select_multilevel
     select_empty
     btree_nonroot_split
-    internal_split_unimplemented
+    btree_internal_split
+    btree_internal_split_persists
+    page_cache_full
 )
 foreach(t ${MINI_SQL_TESTS})
     add_test(

@@ -74,7 +74,23 @@
  */
 #ifndef MINI_SQL_INTERNAL_NODE_MAX_KEYS
 #define MINI_SQL_INTERNAL_NODE_MAX_KEYS INTERNAL_NODE_LAYOUT_MAX_KEYS
+#elif MINI_SQL_INTERNAL_NODE_MAX_KEYS < 3
+/*
+ * Splitting a full internal node leaves half its keys on each side and sends
+ * the middle one up, so with fewer than 3 keys one half would be left with no
+ * keys and a single child — or, at 0, the split would underflow.
+ */
+#error "MINI_SQL_INTERNAL_NODE_MAX_KEYS must be at least 3"
 #endif
+
+/*
+ * The page number stored in an internal node's right-child slot until a real
+ * child is put there. Page 0 can't serve as "unset", since it's always the
+ * root; this value is far beyond any page the pager will fetch, so following
+ * it by mistake fails loudly in pager_get_page's bounds check rather than
+ * quietly leading back to the root.
+ */
+#define INVALID_PAGE_NUM UINT32_MAX
 
 /*
  * Reads the node-kind byte. Stored as a uint8_t rather than the enum so the
@@ -278,12 +294,18 @@ uint32_t internal_node_find_child(void* node, uint32_t key){
     return min_index;
 }
 
-/* Prepares a page as an empty, non-root internal node with no parent set. */
+/*
+ * Prepares a page as an empty, non-root internal node with no parent set. The
+ * right child is marked invalid rather than left as whatever the page held:
+ * a leftover 0 there would make the new node look like the root's parent.
+ * Every caller installs the real right child before the node is read.
+ */
 static void initialize_internal_node(void* node){
     set_node_type(node, NODE_INTERNAL);
     set_node_root(node, false);
     *node_parent(node) = 0;
     *internal_node_num_keys(node) = 0;
+    *internal_node_right_child(node) = INVALID_PAGE_NUM;
 }
 
 /*
@@ -298,23 +320,43 @@ static uint32_t internal_node_max_keys(void){
 }
 
 /*
- * The largest key stored in a node, used as the separator key a parent keeps
- * for it. For a leaf that's simply its last cell. For an internal node this
- * returns its last separator key, which is not the true maximum of the subtree
- * (that lives under the right child) — correct today because every caller
- * passes a leaf, and revisited once internal nodes can be split. The caller
- * must not pass an empty node. An unrecognized type byte means the page is
- * corrupt, so it aborts rather than hand back a made-up key.
+ * The largest key stored anywhere under a node, used as the separator key a
+ * parent keeps for it.
+ *
+ * For a leaf that's simply its last cell. For an internal node it's the
+ * maximum of its rightmost subtree, so the walk follows right children down to
+ * a leaf and takes that leaf's last key. An internal node's own last separator
+ * would be the wrong answer: it only bounds the child to its left, and misses
+ * every key under the right child. The walk is a loop, like the descent in
+ * table_find, and costs one page fetch per level.
+ *
+ * The caller must not pass an empty node. An unrecognized type byte means the
+ * page is corrupt, so it aborts rather than hand back a made-up key.
  */
-static uint32_t get_node_max_key(void* node, const Schema* schema){
-    switch(get_node_type(node)){
-        case NODE_INTERNAL:
-            return *internal_node_key(node, *internal_node_num_keys(node) - 1);
-        case NODE_LEAF:
-            return *leaf_node_key(node, *leaf_node_num_cells(node) - 1, schema);
+static uint32_t get_node_max_key(Pager* pager, void* node, const Schema* schema){
+    while(get_node_type(node) == NODE_INTERNAL)
+        node = pager_get_page(pager, *internal_node_right_child(node));
+
+    if(get_node_type(node) != NODE_LEAF){
+        printf("Corrupt node: unknown node type\n");
+        exit(EXIT_FAILURE);
     }
-    printf("Corrupt node: unknown node type\n");
-    exit(EXIT_FAILURE);
+    return *leaf_node_key(node, *leaf_node_num_cells(node) - 1, schema);
+}
+
+/*
+ * Points every child of the internal node `node`, which lives on `page_num`,
+ * back at it through their parent fields. Called whenever children arrive in a
+ * node wholesale — a split moving half of them to a new sibling, or a root
+ * split copying the root's contents to a new page — since each child still
+ * names the page it came from.
+ */
+static void reparent_children(Pager* pager, void* node, uint32_t page_num){
+    uint32_t num_keys = *internal_node_num_keys(node);
+    for(uint32_t i = 0; i <= num_keys; ++i){
+        void* child = pager_get_page(pager, *internal_node_child(node, i));
+        *node_parent(child) = page_num;
+    }
 }
 
 /*
@@ -329,6 +371,12 @@ static uint32_t get_node_max_key(void* node, const Schema* schema){
  * Both halves record the root page as their parent, which is how a later split
  * of either one finds the node to update.
  *
+ * The root that split may be a leaf or an internal node, and the two halves are
+ * whatever kind it was. When it was internal, the children of the copied half
+ * still name the root page as their parent, so they're pointed at the copy's
+ * new page. The right half was built fresh by the split and already has its
+ * children pointing at it.
+ *
  * num_keys is set before the child is written because internal_node_child
  * resolves "child num_keys" to the right-child slot in the header.
  */
@@ -341,12 +389,14 @@ static void create_new_root(Pager* pager, uint32_t root_page_num, uint32_t right
 
     memcpy(left_child, root, PAGE_SIZE);
     set_node_root(left_child, false);
+    if(get_node_type(left_child) == NODE_INTERNAL)
+        reparent_children(pager, left_child, left_child_page_num);
 
     initialize_internal_node(root);
     set_node_root(root, true);
     *internal_node_num_keys(root) = 1;
     *internal_node_child(root, 0) = left_child_page_num;
-    *internal_node_key(root, 0) = get_node_max_key(left_child, schema);
+    *internal_node_key(root, 0) = get_node_max_key(pager, left_child, schema);
     *internal_node_right_child(root) = right_child_page_num;
 
     *node_parent(left_child) = root_page_num;
@@ -358,20 +408,33 @@ static void create_new_root(Pager* pager, uint32_t root_page_num, uint32_t right
  * child's maximum dropped from `old_key` to `new_key` (a split moved its upper
  * half to a new sibling).
  *
- * The child is found by searching for its old maximum, which works because a
- * separator always equals the maximum of the child on its left: keys reach a
- * child only if they're <= its separator, and nothing is ever deleted. When the
- * search lands on num_keys the child is the rightmost one, which has no
- * separator of its own to update. The tutorial writes the new key into the
- * slot one past the last key anyway — a cell that isn't part of the node — so
- * that case is skipped here, and internal_node_insert records the rightmost
- * child's new maximum when it moves that child into a cell.
+ * The child is found by searching for `old_key`, which lands on the child whose
+ * key range contains it — the first child whose separator is >= it. Any key
+ * that was stored under the child before the split lies in that range, so the
+ * old maximum finds it. It usually equals the separator exactly, but not always:
+ * in a cascade of splits, the old node's rightmost leaf may itself have just
+ * split, leaving a smaller maximum than the separator above it still records.
+ * The range search finds the child either way. When the search lands on
+ * num_keys the child is the rightmost one, which has no separator of its own to
+ * update. The tutorial writes the new key into the slot one past the last key
+ * anyway — a cell that isn't part of the node — so that case is skipped here,
+ * and internal_node_insert records the rightmost child's new maximum when it
+ * moves that child into a cell.
  */
 static void update_internal_node_key(void* node, uint32_t old_key, uint32_t new_key){
     uint32_t old_child_index = internal_node_find_child(node, old_key);
     if(old_child_index < *internal_node_num_keys(node))
         *internal_node_key(node, old_child_index) = new_key;
 }
+
+/*
+ * Declared ahead of internal_node_insert because the two call each other: a
+ * full node splits, and a split inserts into the node's parent, which may be
+ * full in turn. Each call moves one level up the tree, so the recursion is no
+ * deeper than the tree is tall.
+ */
+static void internal_node_split_and_insert(Pager* pager, uint32_t page_num, uint32_t child_page_num,
+                                           const Schema* schema);
 
 /*
  * Adds the node on `child_page_num` as a new child of the internal node on
@@ -385,28 +448,33 @@ static void update_internal_node_key(void* node, uint32_t old_key, uint32_t new_
  * insertion point onward move one slot right and the new (child, key) cell
  * fills the gap.
  *
- * A full parent would have to split, which isn't implemented yet, so that
- * aborts — and it does so before num_keys is touched, unlike the tutorial,
- * which bumps the count first. The count is then raised before any cell is
- * written, because internal_node_child resolves child original_num_keys to the
- * header's right-child slot until the count moves past it.
+ * A full parent is split instead, and the split places the child in whichever
+ * half owns its keys. That check comes before num_keys is touched, unlike the
+ * tutorial's first version, which bumped the count first. The count is then
+ * raised before any cell is written, because internal_node_child resolves
+ * child original_num_keys to the header's right-child slot until the count
+ * moves past it.
+ *
+ * Attaching the child is also where it learns its parent, so every node that
+ * gains a parent through here records it the same way — whether it's a leaf
+ * fresh from a split or an internal node climbing up a cascade of them.
  */
 static void internal_node_insert(Pager* pager, uint32_t parent_page_num, uint32_t child_page_num,
                                  const Schema* schema){
     void* parent = pager_get_page(pager, parent_page_num);
     void* child = pager_get_page(pager, child_page_num);
-    uint32_t child_max_key = get_node_max_key(child, schema);
+    uint32_t child_max_key = get_node_max_key(pager, child, schema);
     uint32_t index = internal_node_find_child(parent, child_max_key);
 
     uint32_t original_num_keys = *internal_node_num_keys(parent);
     if(original_num_keys >= internal_node_max_keys()){
-        printf("Need to implement splitting internal node\n");
-        exit(EXIT_FAILURE);
+        internal_node_split_and_insert(pager, parent_page_num, child_page_num, schema);
+        return;
     }
 
     uint32_t right_child_page_num = *internal_node_right_child(parent);
     void* right_child = pager_get_page(pager, right_child_page_num);
-    uint32_t right_child_max_key = get_node_max_key(right_child, schema);
+    uint32_t right_child_max_key = get_node_max_key(pager, right_child, schema);
 
     *internal_node_num_keys(parent) = original_num_keys + 1;
 
@@ -424,6 +492,83 @@ static void internal_node_insert(Pager* pager, uint32_t parent_page_num, uint32_
                    INTERNAL_NODE_CELL_SIZE);
         *internal_node_child(parent, index) = child_page_num;
         *internal_node_key(parent, index) = child_max_key;
+    }
+
+    *node_parent(child) = parent_page_num;
+}
+
+/*
+ * Splits the full internal node on `page_num` in two while adding the node on
+ * `child_page_num` as a child — the internal-node counterpart of
+ * leaf_node_split_and_insert, and shaped the same way: split in place, then
+ * either grow a new root or update the parent.
+ *
+ * With k keys, the node's upper cells (from key k/2 + 1 on) and its right child
+ * move to a new sibling in one copy, and the moved children are pointed at
+ * their new parent. The node keeps its first k/2 cells, and the child in cell
+ * k/2 becomes its right child. Key k/2 itself isn't copied anywhere: it was the
+ * maximum of that child, so it's now the maximum of the whole node, and the
+ * parent's separator for the node takes over that role. The split uses the
+ * node's actual key count rather than the configured cap, so a node filled by
+ * a build with a larger cap still divides correctly.
+ *
+ * The pending child then goes into whichever half owns its keys: the node if
+ * its maximum is below the node's new maximum, the sibling otherwise. Neither
+ * half is full after the split, so that insert never splits again.
+ *
+ * Finally the level above learns about the sibling, exactly as for a leaf. A
+ * root gets a new root above the two halves. Otherwise the node's separator in
+ * its parent drops to the node's new maximum, located by the maximum it had
+ * before the split, and the sibling is inserted into the parent — which may be
+ * full too, so the split can cascade up to the root.
+ *
+ * The tutorial reaches the same trees another way: for a root it creates the
+ * new root first and splits the copy, and it builds the sibling one
+ * internal_node_insert at a time, which is quadratic in the node size. After
+ * the recursive insert into the parent it also resets the sibling's parent to
+ * the node's own, which is wrong whenever the parent's split sends the two to
+ * different halves. Here the sibling's parent is set by whichever insert
+ * actually places it.
+ */
+static void internal_node_split_and_insert(Pager* pager, uint32_t page_num, uint32_t child_page_num,
+                                           const Schema* schema){
+    void* old_node = pager_get_page(pager, page_num);
+    uint32_t old_max = get_node_max_key(pager, old_node, schema);
+    void* child = pager_get_page(pager, child_page_num);
+    uint32_t child_max = get_node_max_key(pager, child, schema);
+
+    uint32_t new_page_num = get_unused_page_num(pager);
+    void* new_node = pager_get_page(pager, new_page_num);
+    initialize_internal_node(new_node);
+    *node_parent(new_node) = *node_parent(old_node);
+
+    uint32_t num_keys = *internal_node_num_keys(old_node);
+    uint32_t split_index = num_keys / 2;
+    uint32_t moved_keys = num_keys - split_index - 1;
+
+    memcpy(internal_node_cell(new_node, 0),
+           internal_node_cell(old_node, split_index + 1),
+           moved_keys * INTERNAL_NODE_CELL_SIZE);
+    *internal_node_num_keys(new_node) = moved_keys;
+    *internal_node_right_child(new_node) = *internal_node_right_child(old_node);
+    reparent_children(pager, new_node, new_page_num);
+
+    *internal_node_right_child(old_node) = *internal_node_child(old_node, split_index);
+    *internal_node_num_keys(old_node) = split_index;
+
+    uint32_t destination_page_num =
+        child_max < get_node_max_key(pager, old_node, schema) ? page_num : new_page_num;
+    internal_node_insert(pager, destination_page_num, child_page_num, schema);
+
+    if(is_node_root(old_node)){
+        create_new_root(pager, page_num, new_page_num, schema);
+    }
+    else{
+        uint32_t parent_page_num = *node_parent(old_node);
+        void* parent = pager_get_page(pager, parent_page_num);
+
+        update_internal_node_key(parent, old_max, get_node_max_key(pager, old_node, schema));
+        internal_node_insert(pager, parent_page_num, new_page_num, schema);
     }
 }
 
@@ -457,7 +602,7 @@ static void internal_node_insert(Pager* pager, uint32_t parent_page_num, uint32_
 static void leaf_node_split_and_insert(Pager* pager, uint32_t page_num, uint32_t cell_num,
                                        uint32_t key, const Record* value, const Schema* schema){
     void* old_node = pager_get_page(pager, page_num);
-    uint32_t old_max = get_node_max_key(old_node, schema);
+    uint32_t old_max = get_node_max_key(pager, old_node, schema);
     uint32_t new_page_num = get_unused_page_num(pager);
     void* new_node = pager_get_page(pager, new_page_num);
     initialize_leaf_node(new_node);
@@ -504,7 +649,7 @@ static void leaf_node_split_and_insert(Pager* pager, uint32_t page_num, uint32_t
     }
     else{
         uint32_t parent_page_num = *node_parent(old_node);
-        uint32_t new_max = get_node_max_key(old_node, schema);
+        uint32_t new_max = get_node_max_key(pager, old_node, schema);
         void* parent = pager_get_page(pager, parent_page_num);
 
         update_internal_node_key(parent, old_max, new_max);

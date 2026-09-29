@@ -86,9 +86,207 @@ tree_over_leaves() {
     done
 }
 
+# The users table's leaf capacity (pinned by t_constants).
+LEAF_MAX_CELLS=13
+
+# btree_check OUTPUT MAX_KEYS -> checks the tree printed by .btree against the
+# B+ tree invariants and prints its height (the number of levels, leaves
+# included). Fails, naming the first broken rule, if:
+#   - leaf keys don't strictly increase from the first leaf to the last
+#   - a separator isn't the last leaf key printed before it, i.e. the largest
+#     key in the subtree on its left
+#   - a node's printed size disagrees with what's printed under it, or an
+#     internal node doesn't alternate child, key, child ... child
+#   - a node is empty or holds more than it may (LEAF_MAX_CELLS / MAX_KEYS)
+#   - leaves sit at different depths
+# Lets a test cover a tree of any size and insertion order without spelling
+# the whole tree out.
+btree_check() {
+    btree_block "$1" | awk -v max_keys="$2" -v max_cells="$LEAF_MAX_CELLS" '
+        function fail(msg) {
+            printf "btree_check: %s (line %d: %s)\n", msg, NR, $0 > "/dev/stderr"
+            failed = 1
+            exit 1
+        }
+        # closes every open node at depth >= d, checking its counts
+        function close_to(d) {
+            while (top > 0 && depth[top] >= d) {
+                if (entries[top] != size[top])
+                    fail(kind[top] " prints " entries[top] " entries but claims size " size[top])
+                if (kind[top] == "internal" && children[top] != size[top] + 1)
+                    fail("internal node has " children[top] " children for " size[top] " keys")
+                top--
+            }
+        }
+        BEGIN { top = 0; last = -1; leaf_depth = -1 }
+        {
+            match($0, /^ */)
+            if (RLENGTH % 2) fail("odd indentation")
+            d = RLENGTH / 2
+            line = substr($0, RLENGTH + 1)
+        }
+        line ~ /^- (internal|leaf) \(size [0-9]+\)$/ {
+            close_to(d)
+            if (top == 0 && NR > 1) fail("more than one root")
+            if (top > 0) {
+                if (kind[top] != "internal" || depth[top] != d - 1) fail("node outside an internal node")
+                if (children[top] != entries[top]) fail("two children with no separator between them")
+                children[top]++
+            }
+            n = line
+            sub(/.*size /, "", n)
+            sub(/\)$/, "", n)
+            top++
+            kind[top] = (line ~ /internal/) ? "internal" : "leaf"
+            depth[top] = d
+            size[top] = n + 0
+            entries[top] = 0
+            children[top] = 0
+            if (size[top] < 1) fail("empty node")
+            if (kind[top] == "leaf" && size[top] > max_cells) fail("leaf over capacity")
+            if (kind[top] == "internal" && size[top] > max_keys) fail("internal node over capacity")
+            if (kind[top] == "leaf") {
+                if (leaf_depth < 0) leaf_depth = d
+                else if (d != leaf_depth) fail("leaves at different depths")
+            }
+            next
+        }
+        line ~ /^- key [0-9]+$/ {
+            close_to(d)
+            if (top == 0 || kind[top] != "internal" || depth[top] != d - 1) fail("separator outside an internal node")
+            if (children[top] != entries[top] + 1) fail("separator not preceded by a child")
+            k = substr(line, 7) + 0
+            if (k != last) fail("separator " k " is not the largest key on its left (" last ")")
+            entries[top]++
+            next
+        }
+        line ~ /^- [0-9]+$/ {
+            if (top == 0 || kind[top] != "leaf" || depth[top] != d - 1) fail("key outside a leaf")
+            k = substr(line, 3) + 0
+            if (k <= last) fail("key " k " does not follow " last)
+            last = k
+            entries[top]++
+            next
+        }
+        { fail("unrecognized line") }
+        END {
+            if (failed) exit 1
+            if (NR == 0) fail("no tree printed")
+            close_to(0)
+            print leaf_depth + 1
+        }
+    '
+}
+
+# scrambled P -> 1 .. P-1 in a fixed scrambled order: i * 53 mod P for a prime
+# P above 53, which visits every value exactly once. The same on every
+# platform, unlike awk's rand(). The multiplier is chosen so that P = 211
+# reaches the split the tutorial gets wrong (see t_btree_internal_split); many
+# others never do.
+scrambled() {
+    local i
+    for (( i = 1; i < $1; i++ )); do
+        echo $(( i * 53 % $1 ))
+    done
+}
+
+# require_small_fanout -> 0 if $DB is the test build whose internal nodes hold
+# at most 3 keys. Tests that only mean something on that build check it first,
+# so a misregistered binary fails loudly instead of passing vacuously.
+require_small_fanout() {
+    want "$(run $'.constants\n.exit\n')" "INTERNAL_NODE_MAX_KEYS: 3"
+}
+
 # The 30-row insert order from cstack's Part 13 test, whose resulting tree the
 # article prints (a 4-leaf tree with a mis-read first separator; see below).
 CSTACK_4_LEAF_ORDER="18 7 10 29 23 4 14 30 15 26 22 19 2 1 21 11 6 20 5 8 9 3 12 27 17 16 13 24 25 28"
+
+# The 64-row insert order from cstack's Part 14 test, and the 3-level, 7-leaf
+# tree the article prints for it with internal nodes capped at 3 keys.
+CSTACK_7_LEAF_ORDER="58 56 8 54 77 7 25 71 13 22 53 51 59 32 36 79 10 33 20 4 35 76 49 24 70 48 39 15 47 30 86 31 68 37 66 63 40 78 19 46 14 81 72 6 50 85 67 2 55 69 5 65 52 1 29 9 43 75 21 82 12 18 60 44"
+CSTACK_7_LEAF_TREE=$(cat <<'EOF'
+- internal (size 1)
+  - internal (size 2)
+    - leaf (size 7)
+      - 1
+      - 2
+      - 4
+      - 5
+      - 6
+      - 7
+      - 8
+    - key 8
+    - leaf (size 11)
+      - 9
+      - 10
+      - 12
+      - 13
+      - 14
+      - 15
+      - 18
+      - 19
+      - 20
+      - 21
+      - 22
+    - key 22
+    - leaf (size 8)
+      - 24
+      - 25
+      - 29
+      - 30
+      - 31
+      - 32
+      - 33
+      - 35
+  - key 35
+  - internal (size 3)
+    - leaf (size 12)
+      - 36
+      - 37
+      - 39
+      - 40
+      - 43
+      - 44
+      - 46
+      - 47
+      - 48
+      - 49
+      - 50
+      - 51
+    - key 51
+    - leaf (size 11)
+      - 52
+      - 53
+      - 54
+      - 55
+      - 56
+      - 58
+      - 59
+      - 60
+      - 63
+      - 65
+      - 66
+    - key 66
+    - leaf (size 7)
+      - 67
+      - 68
+      - 69
+      - 70
+      - 71
+      - 72
+      - 75
+    - key 75
+    - leaf (size 8)
+      - 76
+      - 77
+      - 78
+      - 79
+      - 81
+      - 82
+      - 85
+      - 86
+EOF
+)
 
 # The shape any 14-row insert order must produce: the full root leaf split
 # 7/7 under a new internal root whose one key is the left leaf's maximum.
@@ -301,18 +499,76 @@ t_btree_nonroot_split() {
     [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 30))" ]]
 }
 
-t_internal_split_unimplemented() {
-    # Pins the boundary still standing: a full internal node can't take another
-    # child until internal nodes can split. The real binary runs out of pages
-    # long before a 510-key root fills, so this drives the test build capped at
-    # 3 keys, after first checking it really is that build. Ascending inserts
-    # give the root its third key at row 28 and fill the rightmost leaf at row
-    # 34, so row 35 must stop there, right after row 34 succeeds.
-    local DB="$SMALL_FANOUT_DB" out
-    out=$(run $'.constants\n.exit\n')
-    want "$out" "INTERNAL_NODE_MAX_KEYS: 3" || return 1
-    out=$(run "$(inserts $(seq 1 35))"$'\n.exit\n')
-    [[ "$(tail -n 2 <<<"$out")" == $'db > Executed.\ndb > Need to implement splitting internal node' ]]
+t_btree_internal_split() {
+    # A full internal node splits like a leaf: half its children move to a new
+    # sibling, the pending child joins whichever half owns its keys, and the
+    # parent gets a lowered separator plus the sibling — splitting in turn if
+    # it's full too, up to a new root. The real binary's 510-key nodes never
+    # fill within the page cache, so this runs on the 3-key test build.
+    #
+    # cstack's 64-row order must build the tree the article prints, compared
+    # line for line (the article's own test compares the lines as an unordered
+    # set), and a select must return every row in key order.
+    local DB="$SMALL_FANOUT_DB" order out height
+    require_small_fanout || return 1
+    out=$(run "$(inserts $CSTACK_7_LEAF_ORDER)"$'\n.btree\nselect\n.exit\n')
+    [[ "$(btree_block "$out")" == "$CSTACK_7_LEAF_TREE" ]] || return 1
+    [[ "$(select_rows "$out")" == "$(expected_rows $(printf '%s\n' $CSTACK_7_LEAF_ORDER | sort -n))" ]] || return 1
+
+    # 210 rows ascending (every split on the rightmost path), descending (every
+    # split on the leftmost path, so children shift right and the pending child
+    # stays in the lower half) and scrambled must each leave a valid tree at
+    # least four levels tall — the root split while its children were already
+    # internal — with every row reachable.
+    #
+    # The scrambled order splits a node that is the last child its parent keeps
+    # when the parent splits too, which sends the node's new sibling to the
+    # parent's new half. The tutorial then points the sibling back at the old
+    # half, and the sibling's own next split files a child in the wrong
+    # subtree. A scan still finds every row through the leaf chain; only the
+    # separator check in btree_check sees the damage.
+    for order in "$(seq 1 210)" "$(seq 210 -1 1)" "$(scrambled 211)"; do
+        out=$(run "$(inserts $order)"$'\n.btree\nselect\n.exit\n')
+        height=$(btree_check "$out" 3) && (( height >= 4 )) || return 1
+        [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 210))" ]] || return 1
+    done
+}
+
+t_btree_internal_split_persists() {
+    # Splits find the node to update through parent pointers, and after a
+    # reopen those come from disk. Even ids 2-200 build a four-level tree; odd
+    # ids 199-1, inserted after a reopen, land in every leaf and set off splits
+    # all over it. The tree must stay valid with every row reachable, and still
+    # be so after one more reopen.
+    local DB="$SMALL_FANOUT_DB" out height
+    require_small_fanout || return 1
+    rm -f "$TESTDB"
+    { inserts $(seq 2 2 200); printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
+    out=$(printf '.btree\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    height=$(btree_check "$out" 3) && (( height >= 4 )) || return 1
+
+    out=$({ inserts $(seq 199 -2 1); printf '.btree\nselect\n.exit\n'; } | "$DB" "$TESTDB" | normalize)
+    btree_check "$out" 3 >/dev/null || return 1
+    [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 200))" ]] || return 1
+
+    out=$(printf '.btree\nselect\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    btree_check "$out" 3 >/dev/null &&
+    [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 200))" ]]
+}
+
+t_page_cache_full() {
+    # Pins the boundary still standing: the pager caches at most 100 pages. On
+    # the real binary, 699 ascending rows fill 99 leaves under a root holding 98
+    # separators — a valid tree with every row reachable — and row 700 needs a
+    # 101st page, so it must stop right after row 699 succeeds.
+    local out height
+    out=$(run "$(inserts $(seq 1 699))"$'\n.btree\nselect\n.exit\n')
+    height=$(btree_check "$out" 510) && (( height == 2 )) || return 1
+    want "$out" "- internal (size 98)" || return 1
+    [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 699))" ]] || return 1
+
+    out=$(run "$(inserts $(seq 1 700))"$'\n.exit\n')
+    [[ "$(tail -n 2 <<<"$out")" == $'db > Executed.\ndb > Tried to fetch page number out of bounds. 100 >= 100' ]]
 }
 
 t_duplicate_key() {
@@ -323,7 +579,7 @@ t_duplicate_key() {
     [[ $(grep -cF '(1, user1, person1@example.com)' <<<"$out") -eq 1 ]]
 }
 
-ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split select_multilevel select_empty btree_nonroot_split internal_split_unimplemented)
+ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split select_multilevel select_empty btree_nonroot_split btree_internal_split btree_internal_split_persists page_cache_full)
 
 run_one() {
     if "t_$1"; then

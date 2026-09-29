@@ -74,7 +74,9 @@ void initialize_leaf_node(void* node);
  * Inserts a key/row cell at `cell_num` of the leaf on page `page_num`, shifting
  * later cells right. A full leaf is split in two instead: if that leaf was the
  * root, a new internal root is created above both halves; otherwise its parent
- * gets an updated separator and a new child for the upper half.
+ * gets an updated separator and a new child for the upper half. A parent with
+ * no room splits the same way, and so on up, growing a new root if the split
+ * reaches it — so the tree can grow to any depth.
  */
 void leaf_node_insert(Pager* pager, uint32_t page_num, uint32_t cell_num, uint32_t key,
                       const Record* value, const Schema* schema);
