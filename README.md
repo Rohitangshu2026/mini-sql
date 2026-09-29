@@ -14,8 +14,9 @@ door open to `CREATE TABLE`, `ALTER TABLE`, and multiple tables without a rewrit
 
 Today it is a **persistent B+ tree** over a single table. Rows are kept sorted by
 primary key in 4 KiB leaf pages; internal pages route lookups, so finding a key
-costs one binary search per level; leaves split and grow a new root as the table
-fills; and a chain of sibling pointers lets a scan return every row in key order.
+costs one binary search per level; a full leaf splits anywhere in the tree, adding
+itself to its parent or growing a new root; and a chain of sibling pointers lets a
+scan return every row in key order.
 The pager caches pages in memory and writes them to a single database file.
 
 ---
@@ -104,14 +105,15 @@ tests. No third-party libraries.
 | **O(log n) lookup**: binary search per node, descending from the root | ✅ |
 | **Duplicate primary keys rejected** | ✅ |
 | **Leaf splits** that grow a new internal root | ✅ |
+| **Splits below the root** that update the parent's separators and children | ✅ |
 | **Scans across leaves** through a sibling-pointer chain | ✅ |
 | Input validation (syntax, negative id, over-length text) | ✅ |
 | Schema-driven row (de)serialization | ✅ |
 | Persistence to a single database file | ✅ |
 | Per-statement execution timing | ✅ |
-| Black-box test suite (14 CTest cases) | ✅ |
-| Splitting a leaf that isn't the root | ⛔ next — the table currently tops out at 20–26 rows |
-| Splitting internal nodes | ⛔ |
+| Black-box test suite (15 CTest cases) | ✅ |
+| Splitting internal nodes | ⛔ next — pinned on a test build; see [limitations](#limitations--non-goals) |
+| More than 100 pages | ⛔ the page cache is a fixed array — 699 rows in ascending order |
 | `WHERE`, `DELETE`, `UPDATE` | ⛔ |
 | `CREATE TABLE` / multiple tables | ⛔ single hardcoded schema |
 | Crash safety (journal / WAL) | ⛔ flush happens only on clean `.exit` |
@@ -382,7 +384,7 @@ header:
 | 0 | node type (`0` internal, `1` leaf) |
 | 1 | `is_root` |
 | 2–3 | padding |
-| 4–7 | parent page number (reserved for the parent-update stage) |
+| 4–7 | parent page number (unused on the root) |
 
 **Leaf node** — holds the rows:
 
@@ -412,6 +414,11 @@ leaf cell       = 4 (key) + 291 (row) = 295 → padded to 296
 cells per leaf  = (4096 − 16) / 296       = 13
 keys per internal node = (4096 − 16) / 8  = 510   (511 children)
 ```
+
+The internal-node cap can be lowered at build time with
+`-DMINI_SQL_INTERNAL_NODE_MAX_KEYS=N`. The test suite uses that for a second binary
+capped at 3 keys, the only way to reach a full internal node in a few dozen rows;
+the page layout is identical either way.
 
 Every multi-byte field sits on a 4-byte boundary. That's deliberate: the tutorial
 packs its header into 6 bytes, which puts `uint32_t` fields at odd offsets, and the
@@ -482,11 +489,14 @@ later cells right and writes the new one. A **full** leaf splits instead:
 ```mermaid
 flowchart TD
     A["leaf is full: 13 cells + 1 new"] --> B["allocate a sibling at the end of the file"]
-    B --> C["splice it into the leaf chain after the old leaf"]
+    B --> C["splice it into the leaf chain after the old leaf;<br/>it shares the old leaf's parent"]
     C --> D["distribute 14 cells: 7 stay, 7 move to the sibling"]
     D --> E{was the old leaf the root?}
     E -->|yes| F["create_new_root"]
-    E -->|no| G["abort: parent update not implemented yet"]
+    E -->|no| G["update_internal_node_key:<br/>lower the old leaf's separator"]
+    G --> H{is the parent full?}
+    H -->|no| I["internal_node_insert:<br/>add the sibling as a child"]
+    H -->|yes| J["abort: internal split not implemented yet"]
 ```
 
 Cells are placed walking from the highest position down, which makes it safe to
@@ -499,13 +509,59 @@ contents (now the left half) to a freshly allocated page and reinitializes page 
 as an internal node pointing at both halves, with the left half's maximum as the
 separator. The table's `root_page_num` therefore stays 0 forever, and the copy
 carries the left half's `next_leaf` pointer with it, so the leaf chain comes out
-right without special handling.
+right without special handling. Both halves record page 0 as their parent.
 
 | | before the 14th insert | after |
 | --- | --- | --- |
 | page 0 | leaf, 13 cells (root) | internal root: key 7 → page 2, else page 1 |
 | page 1 | — | leaf, keys 8–14, `next_leaf = 0` |
 | page 2 | — | leaf, keys 1–7 (copied from page 0), `next_leaf = 1` |
+
+### Updating the parent — splitting a leaf below the root
+
+When the leaf that splits isn't the root, its parent gets two edits, in this order:
+
+1. **`update_internal_node_key`** lowers the old leaf's separator to its new, smaller
+   maximum. The old leaf's entry is found by searching the parent for its *previous*
+   maximum, which works because a separator always equals the maximum of the child
+   on its left — keys only reach a child if they're ≤ its separator, and nothing is
+   deleted. The rightmost child has no separator, so if that's the one that split,
+   there's nothing to lower.
+2. **`internal_node_insert`** adds the new leaf in key order, with its maximum as its
+   separator. The rightmost child lives in the header rather than in a cell, which
+   makes this a two-branch operation:
+
+```mermaid
+flowchart TD
+    A["new child's max > rightmost child's max?"] -->|yes| B["old rightmost child moves down into the last cell,<br/>keyed by its max; the new child takes the header slot"]
+    A -->|no| C["cells from the insertion point shift right;<br/>the new (child, key) cell fills the gap"]
+```
+
+Inserting 1–30 in ascending order exercises the first branch every time — the
+rightmost leaf keeps splitting — and produces a four-leaf tree:
+
+```mermaid
+flowchart TD
+    R["page 0 · internal root<br/>keys 7 | 14 | 21"]
+    L1["page 2 · leaf<br/>1 – 7"]
+    L2["page 1 · leaf<br/>8 – 14"]
+    L3["page 3 · leaf<br/>15 – 21"]
+    L4["page 4 · leaf<br/>22 – 30"]
+    R --> L1
+    R --> L2
+    R --> L3
+    R --> L4
+    L1 -.->|next_leaf| L2 -.->|next_leaf| L3 -.->|next_leaf| L4
+```
+
+Inserting 30–1 in descending order exercises the second branch instead, and the
+tutorial's own 30-row test order builds exactly the tree the article prints —
+except that its first separator reads `key 7` here, where the article's
+pointer-arithmetic bug prints `key 1`.
+
+Each child records its parent's page in bytes 4–7 of its header, which is how a
+split finds the node to update. Today every parent is page 0, the only internal
+node; the pointers start pulling their weight once internal nodes split.
 
 ### Scan — walking the leaf chain
 
@@ -702,11 +758,12 @@ Lifecycle rules:
 
 ## Build system
 
-CMake produces two targets:
+CMake builds the engine twice from one source list, `MINI_SQL_SOURCES`: once as
+shipped, and once as a test build whose internal nodes are capped at 3 keys.
 
 ```mermaid
 flowchart LR
-    subgraph lib["mini_sql_lib (static)"]
+    subgraph src["MINI_SQL_SOURCES"]
         a[input_buffer.c]
         b[meta_command.c]
         c[statement.c]
@@ -718,16 +775,23 @@ flowchart LR
         i[cursor.c]
         j[btree.c]
     end
-    main_c[main.c] --> exe["mini_sql (executable)"]
+    src --> lib["mini_sql_lib (static)"]
+    src -->|"MINI_SQL_INTERNAL_NODE_MAX_KEYS=3"| slib["mini_sql_small_fanout_lib (static)"]
+    main_c[main.c] --> exe["mini_sql"]
+    main_c --> sexe["mini_sql_small_fanout"]
     lib --> exe
-    lib -.->|links| tests["CTest suite"]
+    slib --> sexe
+    exe -.->|driven by| tests["CTest suite"]
+    sexe -.->|driven by| tests
 ```
 
 Compiled with `-Wall -Wextra -Wpedantic` under strict C11 (`CMAKE_C_EXTENSIONS
 OFF`), and emits `compile_commands.json` for clangd. The library/executable split
 exists so the test and benchmark targets can link the engine in one line without
-recompiling every source. (`pager.c` and `schema.c` define `_POSIX_C_SOURCE` so the
-POSIX file calls and `strdup` resolve under strict C11.)
+recompiling every source. The small-fan-out build exists only for the tests: with
+510 keys per internal node, filling one takes thousands of rows, while 3 takes a
+few dozen. (`pager.c` and `schema.c` define `_POSIX_C_SOURCE` so the POSIX file
+calls and `strdup` resolve under strict C11.)
 
 ---
 
@@ -741,27 +805,31 @@ per case, so a failure names itself.
 sequenceDiagram
     participant CT as ctest
     participant SH as run_tests.sh
-    participant DB as mini_sql
+    participant DB as mini_sql / mini_sql_small_fanout
 
-    CT->>SH: MINI_SQL_BIN=... run_tests.sh <case>
-    SH->>DB: printf "commands…" | mini_sql <scratch.db>
+    CT->>SH: MINI_SQL_BIN=... MINI_SQL_SMALL_FANOUT_BIN=... run_tests.sh <case>
+    SH->>DB: printf "commands…" | <binary the case needs> <scratch.db>
     DB-->>SH: raw stdout
     SH->>SH: normalize (strip " (NN.NNN ms)" + trailing ws)
     SH->>SH: compare the tree / rows exactly
     SH-->>CT: exit 0 (pass) / 1 (fail)
 ```
 
-The 14 cases:
+Every case receives both binaries. All but one drive the real `mini_sql`; the
+internal-node boundary drives the 3-key test build, and first checks through
+`.constants` that it really got that build.
+
+The 15 cases:
 
 | Area | Cases |
 | --- | --- |
 | Basics | insert/select round trip; max-length strings; over-length strings; negative id |
 | Persistence | rows survive a reopen |
-| Layout | `.constants` pins every size and offset |
-| Tree shape | one sorted leaf; a root split under four insertion orders; the split survives a reopen; inserts routed left and right after the split, including a key equal to the separator |
-| Duplicates | rejected in a single leaf and in either leaf of a split tree |
-| Scans | every row in key order across leaves, for four insertion orders and across a reopen; an empty table |
-| Boundary | the next unimplemented step (splitting a non-root leaf) stops with an explicit message |
+| Layout | `.constants` pins every size and offset, and the real 510-key internal capacity |
+| Tree shape | one sorted leaf; a root split under four insertion orders; the split survives a reopen; inserts routed left and right after the split, including a key equal to the separator; four-leaf trees from splits below the root under ascending, descending and the tutorial's pseudorandom order, surviving a reopen |
+| Duplicates | rejected in a single leaf, in either leaf of a split tree, and in a four-leaf tree for keys equal to a separator and just past the last one |
+| Scans | every row in key order across leaves, for four insertion orders and across a reopen, and across four leaves; an empty table |
+| Boundary | the next unimplemented step (splitting a full internal node, on the 3-key test build) stops with an explicit message |
 
 How the suite earns its trust:
 
@@ -772,12 +840,14 @@ How the suite earns its trust:
   14 keys ascending, descending, and with the splitting key landing as the left
   half's last cell and as the right half's first — the exact boundary where an
   off-by-one would hide.
-- **Mutation checks.** The split, routing and scan stages were each verified by
-  deliberately breaking the code and confirming the suite fails: an off-by-one at
-  the split boundary, `>` instead of `>=` when routing past a separator, a missing
-  sibling link, and the tutorial's own split bug — which reproduces its exact
-  corrupted row, `(1919251317, 14, on14@example.com)`, and is caught by the scan
-  test.
+- **Mutation checks.** The split, routing, scan and parent-update stages were each
+  verified by deliberately breaking the code and confirming the suite fails: an
+  off-by-one at the split boundary, `>` instead of `>=` when routing past a
+  separator, a missing sibling link, a skipped separator update, a new child that
+  never takes over the right-child slot, and two of the tutorial's own bugs. Its
+  split bug reproduces its exact corrupted row, `(1919251317, 14,
+  on14@example.com)`, and its `internal_node_key` bug reproduces its published
+  four-leaf tree, `key 1` and all.
 - **Sanitizers.** The B-tree stages were each run under AddressSanitizer and
   UndefinedBehaviorSanitizer, which is what surfaced the misaligned loads in the
   tutorial's node layout.
@@ -822,6 +892,12 @@ isn't checked in scattered places — the only two ways to create a cursor go th
 the same descent that stops only at leaves, and the functions that rely on it assert
 it.
 
+**Test knobs live in a test build.** Reaching a full internal node at the real
+fan-out takes thousands of rows, so the tutorial shrinks the engine's capacity to 3
+"for testing". Here the engine keeps the capacity its page actually has, and the
+small value is a compile-time option used only by a second, test-only binary —
+the same approach SQLite takes with its `SQLITE_*` build options.
+
 **Loud boundaries over wrong answers.** While a feature is missing, the code path
 that would need it stops with a message naming it (`Need to implement …`) instead
 of returning plausible-looking garbage. Tests pin each boundary, and the stage that
@@ -849,7 +925,10 @@ NUL terminator. Bounding the print to `column->size` means `mini-sql` never had 
 | Row text buffers need a `+1` for the NUL | Width-bounded printing (`%.*s`) | No struct, so the max-length-string bug never existed |
 | Packed 6-byte node header | Aligned 8-byte header, 4-byte-multiple cells | `uint32_t` loads are UBSan-clean |
 | The leaf split writes the new row at the start of the cell and never writes its key | Key and row go into their own slots | The corruption the tutorial discovers two parts later never happened here |
-| `internal_node_key` adds 4 to a `uint32_t*` — 16 bytes, not 4 | Byte arithmetic | Separator keys sit at the right offset |
+| `internal_node_key` adds 4 to a `uint32_t*` — 16 bytes, not 4 | Byte arithmetic | Separator keys sit at the right offset; the article's four-leaf tree prints `key 1` where mini-sql prints `key 7` |
+| Internal nodes capped at 3 keys "for testing" | The real 510; a separate test binary is built with 3 | The engine uses the page it has, and tests still reach a full node cheaply |
+| When the rightmost child splits, the separator update writes a key one past the node's last cell | Skipped — the rightmost child has no separator | No writes outside the node's live cells |
+| A full parent's key count is bumped before aborting | Checked before anything changes | The count never disagrees with the cells |
 | Mutual recursion between two search functions that return cursors | An iterative descent in `cursor`; `btree` returns indices | `btree` stays free of cursors; no recursion |
 | As written in the articles, the duplicate check reads the root node | It reads the leaf the cursor landed in | Correct as soon as the root splits |
 | A cursor leaks on a duplicate key | Freed | No leak per rejected insert |
@@ -876,20 +955,21 @@ flowchart LR
     classDef now fill:#fff2cc,stroke:#bba12a;
     classDef todo fill:#eeeeee,stroke:#999999;
 
-    class A,B done;
-    class C now;
-    class D,E,F,G todo;
+    class A,B,C done;
+    class D now;
+    class E,F,G todo;
 ```
 
 - **Done — storage foundations (1–6):** REPL, schema-driven rows, tests, a
   file-backed pager, and the cursor abstraction.
-- **Done — B-tree (7–12):** sorted leaves with binary search, duplicate-key
-  rejection, leaf splits that grow a new root, descent through internal nodes, and
-  leaf-chain scans.
-- **Next — updating the parent after a split (13):** splitting a leaf that isn't the
-  root adds a key and a child to its parent. This lifts today's 20–26-row ceiling;
-  the next limits become a full internal root and the pager's 100-page cache.
-- **Then — splitting internal nodes (14):** the tree can grow to any depth.
+- **Done — B-tree (7–13):** sorted leaves with binary search, duplicate-key
+  rejection, leaf splits that grow a new root, descent through internal nodes,
+  leaf-chain scans, and splits below the root that update their parent.
+- **Next — splitting internal nodes (14):** a full internal node splits and hands a
+  new child to its own parent, recursively up to a new root, so the tree can grow
+  to any depth. At the real fan-out a root fills only after 511 leaves, beyond the
+  pager's 100-page cache, so this is exercised on the 3-key test build until the
+  cache can grow.
 - **Then — `WHERE` and `DELETE`:** a point lookup is `table_find` plus one cell; a
   range scan is `table_find(low)` plus a walk along the leaf chain.
 - **Then — catalog + DDL:** a name→table registry, then runtime `CREATE TABLE` and the
@@ -903,7 +983,7 @@ flowchart LR
 
 ```text
 mini-sql/
-├── CMakeLists.txt          # two targets: mini_sql_lib (static) + mini_sql (exe)
+├── CMakeLists.txt          # mini_sql_lib + mini_sql, and a 3-key-fan-out test build
 ├── include/
 │   ├── input_buffer.h      # line reader
 │   ├── meta_command.h      # dot-commands
@@ -937,9 +1017,12 @@ mini-sql/
 
 This is a learning engine. Known gaps, most of them on the [roadmap](#roadmap):
 
-- **Capacity** — splitting a leaf that isn't the root isn't implemented yet, so the
-  table tops out at 20 rows inserted in ascending order, and at most 26. The insert
-  that would need it stops with `Need to implement updating parent after split`.
+- **Capacity** — the pager caches at most 100 pages in a fixed array, so the table
+  tops out at 699 rows inserted in ascending order, and at most 1,287 (99 full
+  leaves). The insert that needs a 101st page stops with `Tried to fetch page number
+  out of bounds`. Internal nodes can't split yet either, but a 510-key root outlasts the
+  page cache; the 3-key test build reaches that boundary at the 35th ascending row,
+  where it stops with `Need to implement splitting internal node`.
 - **Crash safety** — pages are flushed only on a clean `.exit`; kill the process, or
   hit one of the boundaries above, and unsaved changes are lost. No rollback journal
   or WAL.
