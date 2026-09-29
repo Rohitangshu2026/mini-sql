@@ -4,12 +4,19 @@
 # Mirrors cstack's rspec suite, adapted to this project's output.
 #
 # Usage:
-#   MINI_SQL_BIN=./build/mini_sql tests/run_tests.sh [test_name]
+#   MINI_SQL_BIN=./build/mini_sql \
+#   MINI_SQL_SMALL_FANOUT_BIN=./build/mini_sql_small_fanout \
+#   tests/run_tests.sh [test_name]
 #   (no test_name runs them all; CTest invokes one name per registered test)
+#
+# Most tests drive the real binary. A few need internal nodes that fill up
+# after a handful of rows, and drive the small-fan-out test build instead by
+# declaring `local DB="$SMALL_FANOUT_DB"`, which the helpers below then use.
 #
 set -u
 
 DB="${MINI_SQL_BIN:-./build/mini_sql}"
+SMALL_FANOUT_DB="${MINI_SQL_SMALL_FANOUT_BIN:-./build/mini_sql_small_fanout}"
 TESTDB="${TMPDIR:-/tmp}/mini_sql_test.db"
 
 # Strip our timing suffix " (12.345 ms)" and trailing whitespace so the
@@ -58,6 +65,30 @@ expected_rows() {
         printf '(%s, user%s, person%s@example.com)\n' "$id" "$id" "$id"
     done
 }
+
+# tree_over_leaves RANGE... -> what .btree prints for an internal root over one
+# leaf per RANGE ("first-last", every id in between), left to right. Each leaf
+# but the last is followed by its separator: the leaf's own largest key.
+tree_over_leaves() {
+    local range first last id remaining=$#
+    printf -- '- internal (size %s)\n' $((remaining - 1))
+    for range in "$@"; do
+        first=${range%-*}
+        last=${range#*-}
+        printf -- '  - leaf (size %s)\n' $((last - first + 1))
+        for id in $(seq "$first" "$last"); do
+            printf -- '    - %s\n' "$id"
+        done
+        remaining=$((remaining - 1))
+        if (( remaining > 0 )); then
+            printf -- '  - key %s\n' "$last"
+        fi
+    done
+}
+
+# The 30-row insert order from cstack's Part 13 test, whose resulting tree the
+# article prints (a 4-leaf tree with a mis-read first separator; see below).
+CSTACK_4_LEAF_ORDER="18 7 10 29 23 4 14 30 15 26 22 19 2 1 21 11 6 20 5 8 9 3 12 27 17 16 13 24 25 28"
 
 # The shape any 14-row insert order must produce: the full root leaf split
 # 7/7 under a new internal root whose one key is the left leaf's maximum.
@@ -132,7 +163,8 @@ t_constants() {
     want "$out" "LEAF_NODE_HEADER_SIZE: 16" &&
     want "$out" "LEAF_NODE_CELL_SIZE: 296" &&
     want "$out" "LEAF_NODE_SPACE_FOR_CELLS: 4080" &&
-    want "$out" "LEAF_NODE_MAX_CELLS: 13"
+    want "$out" "LEAF_NODE_MAX_CELLS: 13" &&
+    want "$out" "INTERNAL_NODE_MAX_KEYS: 510"
 }
 
 t_btree_one_node() {
@@ -235,13 +267,52 @@ t_select_empty() {
     [[ -z "$(select_rows "$out")" ]] && want "$out" "Executed."
 }
 
-t_multilevel_unimplemented() {
-    # Pins the boundary still standing: splitting a leaf that isn't the root
-    # needs its parent updated. Ascending inserts fill the right leaf at row
-    # 20, so row 21 must stop there, right after row 20 succeeds.
-    local out
-    out=$(run "$(inserts $(seq 1 21))"$'\n.exit\n')
-    [[ "$(tail -n 2 <<<"$out")" == $'db > Executed.\ndb > Need to implement updating parent after split' ]]
+t_btree_nonroot_split() {
+    # Thirty rows split leaves that aren't the root, so the parent has to take
+    # a lowered separator for the old leaf and a new child for its upper half.
+    # Each order drives that fix-up down a different path:
+    #   ascending      -> the rightmost leaf keeps splitting, so each new leaf
+    #                     takes over the root's right-child slot and the old
+    #                     right child moves down into a cell
+    #   descending     -> the leftmost leaf keeps splitting, so its separator
+    #                     is lowered and later cells shift right for the new one
+    #   cstack's order -> must build the tree the article prints, except for its
+    #                     first separator: the article shows "key 1" there, from
+    #                     the pointer-arithmetic bug in its internal_node_key
+    #                     that this project never had, and the right key is 7
+    # A full select must return all 30 rows in order across the four leaves.
+    local orders=("$(seq 1 30)" "$(seq 30 -1 1)" "$CSTACK_4_LEAF_ORDER")
+    local leaves=("1-7 8-14 15-21 22-30" "1-9 10-16 17-23 24-30" "1-7 8-15 16-22 23-30")
+    local i out
+    for i in 0 1 2; do
+        out=$(run "$(inserts ${orders[i]})"$'\n.btree\nselect\n.exit\n')
+        [[ "$(btree_block "$out")" == "$(tree_over_leaves ${leaves[i]})" ]] || return 1
+        [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 30))" ]] || return 1
+    done
+
+    # With separators 7 | 14 | 21, re-inserting 14 and 21 (equal to a separator,
+    # so routed left to the leaf holding them) and 22 (just past the last one,
+    # so routed to the right child) must all be rejected as duplicates. The
+    # tree and every row must then survive a reopen, all five pages intact.
+    out=$(run "$(inserts $(seq 1 30) 14 21 22)"$'\n.exit\n')
+    [[ $(grep -cF 'Error: Duplicate key.' <<<"$out") -eq 3 ]] || return 1
+    out=$(printf '.btree\nselect\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    [[ "$(btree_block "$out")" == "$(tree_over_leaves 1-7 8-14 15-21 22-30)" ]] &&
+    [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 30))" ]]
+}
+
+t_internal_split_unimplemented() {
+    # Pins the boundary still standing: a full internal node can't take another
+    # child until internal nodes can split. The real binary runs out of pages
+    # long before a 510-key root fills, so this drives the test build capped at
+    # 3 keys, after first checking it really is that build. Ascending inserts
+    # give the root its third key at row 28 and fill the rightmost leaf at row
+    # 34, so row 35 must stop there, right after row 34 succeeds.
+    local DB="$SMALL_FANOUT_DB" out
+    out=$(run $'.constants\n.exit\n')
+    want "$out" "INTERNAL_NODE_MAX_KEYS: 3" || return 1
+    out=$(run "$(inserts $(seq 1 35))"$'\n.exit\n')
+    [[ "$(tail -n 2 <<<"$out")" == $'db > Executed.\ndb > Need to implement splitting internal node' ]]
 }
 
 t_duplicate_key() {
@@ -252,7 +323,7 @@ t_duplicate_key() {
     [[ $(grep -cF '(1, user1, person1@example.com)' <<<"$out") -eq 1 ]]
 }
 
-ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split select_multilevel select_empty multilevel_unimplemented)
+ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split select_multilevel select_empty btree_nonroot_split internal_split_unimplemented)
 
 run_one() {
     if "t_$1"; then

@@ -10,9 +10,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_compile_options(-Wall -Wextra -Wpedantic)
 
-# Library target — every module except main lives here so tests/ and bench/
-# can link against it later without recompiling.
-add_library(mini_sql_lib
+# Every module except main. Listed once because two builds of the engine
+# compile it (see the small-fan-out build below).
+set(MINI_SQL_SOURCES
     src/input_buffer.c
     src/meta_command.c
     src/statement.c
@@ -24,14 +24,30 @@ add_library(mini_sql_lib
     src/cursor.c
     src/btree.c
 )
+
+# Library target — every module except main lives here so tests/ and bench/
+# can link against it later without recompiling.
+add_library(mini_sql_lib ${MINI_SQL_SOURCES})
 target_include_directories(mini_sql_lib PUBLIC include)
 
 # Executable — just the REPL entry point, linked against the library.
 add_executable(mini_sql src/main.c)
 target_link_libraries(mini_sql PRIVATE mini_sql_lib)
 
+# Test-only build of the same engine with internal nodes capped at 3 keys
+# instead of the 510 a page holds. Reaching a full internal node then takes a
+# few dozen rows rather than thousands, so the tests can pin what happens
+# there. Same sources and file format; only the cap differs.
+add_library(mini_sql_small_fanout_lib ${MINI_SQL_SOURCES})
+target_include_directories(mini_sql_small_fanout_lib PUBLIC include)
+target_compile_definitions(mini_sql_small_fanout_lib PRIVATE MINI_SQL_INTERNAL_NODE_MAX_KEYS=3)
+
+add_executable(mini_sql_small_fanout src/main.c)
+target_link_libraries(mini_sql_small_fanout PRIVATE mini_sql_small_fanout_lib)
+
 # Black-box tests: each pipes commands into the built REPL and checks
 # its output. One CTest entry per case so failures point at the exact test.
+# Every case is handed both binaries and uses the one it needs.
 enable_testing()
 set(MINI_SQL_TESTS
     inserts_and_retrieves
@@ -47,12 +63,15 @@ set(MINI_SQL_TESTS
     btree_insert_after_split
     select_multilevel
     select_empty
-    multilevel_unimplemented
+    btree_nonroot_split
+    internal_split_unimplemented
 )
 foreach(t ${MINI_SQL_TESTS})
     add_test(
         NAME ${t}
-        COMMAND ${CMAKE_COMMAND} -E env MINI_SQL_BIN=$<TARGET_FILE:mini_sql>
+        COMMAND ${CMAKE_COMMAND} -E env
+                MINI_SQL_BIN=$<TARGET_FILE:mini_sql>
+                MINI_SQL_SMALL_FANOUT_BIN=$<TARGET_FILE:mini_sql_small_fanout>
                 bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tests.sh ${t}
     )
 endforeach()
