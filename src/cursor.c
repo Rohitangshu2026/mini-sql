@@ -75,8 +75,9 @@ void* cursor_value(Cursor* cursor){
  * Within a leaf that is just the next index. Past the last cell, the cursor
  * follows the leaf's next_leaf pointer to cell 0 of its right sibling, so a
  * scan crosses from one leaf to the next without climbing back through the
- * internal nodes. Only the rightmost leaf has no sibling (next_leaf == 0), and
- * running off it ends the table. Moving strictly along the leaf chain is what
+ * internal nodes. Only the rightmost leaf has no sibling (next_leaf == 0, which
+ * can't be a real sibling because page 0 is the file header), and running off
+ * it ends the table. Moving strictly along the leaf chain is what
  * keeps the cursor on a leaf, as the invariant requires.
  *
  * Landing on cell 0 of the sibling assumes no leaf is ever empty except the

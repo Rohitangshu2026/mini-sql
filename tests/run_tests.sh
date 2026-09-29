@@ -583,19 +583,123 @@ t_btree_internal_split_persists() {
     [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 200))" ]]
 }
 
-t_page_cache_full() {
-    # Pins the boundary still standing: the pager caches at most 100 pages. On
-    # the real binary, 699 ascending rows fill 99 leaves under a root holding 98
-    # separators — a valid tree with every row reachable — and row 700 needs a
-    # 101st page, so it must stop right after row 699 succeeds.
+t_large_table() {
+    # The page cache grows with the file instead of stopping at 100 pages, which
+    # takes the real binary to its first internal split. Ascending rows leave 7
+    # per leaf, so 3,583 of them fill 511 leaves under a root holding exactly
+    # 510 keys — full. Row 3,584 splits a leaf into that full root, so the root
+    # splits too and the tree grows a third level. Every row must be reachable,
+    # and still be after a reopen.
     local out height
-    out=$(run "$(inserts $(seq 1 699))"$'\n.btree\nSELECT * FROM users;\n.exit\n')
+    out=$(run "$(inserts $(seq 1 3583))"$'\n.btree\n.exit\n')
     height=$(btree_check "$out" 510) && (( height == 2 )) || return 1
-    want "$out" "- internal (size 98)" || return 1
-    [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 699))" ]] || return 1
+    want "$out" "- internal (size 510)" || return 1
 
-    out=$(run "$(inserts $(seq 1 700))"$'\n.exit\n')
-    [[ "$(tail -n 2 <<<"$out")" == $'db > Executed.\ndb > Tried to fetch page number out of bounds. 100 >= 100' ]]
+    out=$(run "$(inserts $(seq 1 3584))"$'\n.btree\nSELECT * FROM users;\n.exit\n')
+    height=$(btree_check "$out" 510) && (( height == 3 )) || return 1
+    [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 3584))" ]] || return 1
+
+    out=$(printf '.btree\nSELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    height=$(btree_check "$out" 510) && (( height == 3 )) &&
+    [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 3584))" ]]
+}
+
+t_file_header() {
+    # Page 0 of a new database is its header: the magic string, then format 1,
+    # 4096-byte pages and the table's root on page 1 (the fields are read in the
+    # host's byte order, like the file writes them). The header doesn't change
+    # as the table grows or across a reopen, while page 1 becomes the internal
+    # root after the first split.
+    local copy="$TESTDB.copy" script
+    rm -f "$TESTDB"
+    { inserts $(seq 1 30); printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
+    [[ "$(head -c 16 "$TESTDB" | tr '\0' '@')" == "mini-sql format@" ]] || return 1
+    [[ "$(od -An -tu4 -j16 -N12 "$TESTDB" | xargs)" == "1 4096 1" ]] || return 1
+    [[ "$(od -An -tu1 -j4096 -N2 "$TESTDB" | xargs)" == "0 1" ]] || return 1   # internal, root
+
+    # The rest of page 0 is reserved for fields later formats add, which will
+    # read an old file's zeros as "not set", so it must be zero.
+    [[ "$(head -c 4096 "$TESTDB" | tail -c 4068 | tr -d '\0' | wc -c | xargs)" == 0 ]] || return 1
+
+    head -c 4096 "$TESTDB" >"$copy"
+    { inserts $(seq 31 60); printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
+    head -c 4096 "$TESTDB" | cmp -s - "$copy" || return 1
+
+    # The same statements always produce the same file, byte for byte — even
+    # after a stream of rejected statements has churned the heap. New pages
+    # start zeroed, so bytes nothing writes (cell padding, the tails of fresh
+    # pages) can't carry leftover memory. On macOS a fresh 4 KiB allocation
+    # happens to be zeroed anyway, so this check alone can't tell calloc from
+    # malloc there; it pins the determinism the zeroing guarantees everywhere.
+    script="$(printf 'SELECT * FORM users\nINSERT INTO users VALUES (1, 2, 3)\n%.0s' $(seq 1 50))"$'\n'"$(inserts $(scrambled 211))"$'\n.exit\n'
+    rm -f "$TESTDB"
+    printf '%s' "$script" | "$DB" "$TESTDB" >/dev/null
+    cp "$TESTDB" "$copy"
+    rm -f "$TESTDB"
+    printf '%s' "$script" | "$DB" "$TESTDB" >/dev/null
+    cmp -s "$TESTDB" "$copy"
+    local same=$?
+    rm -f "$copy"
+    return "$same"
+}
+
+# expect_refusal MESSAGE -> opens $TESTDB, which the caller has prepared, and
+# succeeds if the binary refused it: printed exactly MESSAGE, exited with a
+# failing status, and left the file byte for byte as it was
+expect_refusal() {
+    local original="$TESTDB.original" out status
+    cp "$TESTDB" "$original"
+    out=$(printf '.exit\n' | "$DB" "$TESTDB")
+    status=$?
+    cmp -s "$TESTDB" "$original"
+    local unchanged=$?
+    rm -f "$original"
+    [[ "$out" == "$1" ]] && (( status != 0 )) && (( unchanged == 0 ))
+}
+
+# patch_bytes OFFSET BYTES -> overwrites bytes of $TESTDB in place, BYTES being
+# printf escapes such as '\002\000\000\000' (little-endian for a 4-byte field)
+patch_bytes() {
+    printf "$2" | dd of="$TESTDB" bs=1 seek="$1" conv=notrunc 2>/dev/null
+}
+
+t_file_rejects_foreign() {
+    # A file this build can't read is refused before the REPL starts, with a
+    # message saying why, and is never written to. Files from before the header
+    # existed hold a node where the magic belongs, so they're refused as "not
+    # a mini-sql database"; the other cases patch one field of a good header.
+    local not_ours="Error: $TESTDB is not a mini-sql database, or was written by an older build."
+
+    head -c 4096 /dev/zero >"$TESTDB"
+    expect_refusal "$not_ours" || return 1
+
+    { printf '\001\001'; head -c 4094 /dev/zero; } >"$TESTDB"   # an old root leaf on page 0
+    expect_refusal "$not_ours" || return 1
+
+    printf 'x%.0s' $(seq 1 4096) >"$TESTDB"
+    expect_refusal "$not_ours" || return 1
+
+    make_good_file() {
+        rm -f "$TESTDB"
+        { inserts 1; printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
+    }
+
+    make_good_file; patch_bytes 16 '\002\000\000\000'
+    expect_refusal "Error: $TESTDB uses file format 2; this build reads format 1." || return 1
+
+    make_good_file; patch_bytes 20 '\000\040\000\000'
+    expect_refusal "Error: $TESTDB uses 8192-byte pages; this build uses 4096." || return 1
+
+    make_good_file; patch_bytes 24 '\000\000\000\000'
+    expect_refusal "Error: $TESTDB is corrupt: its root page 0 is not a node page of the file." || return 1
+
+    make_good_file; patch_bytes 24 '\143\000\000\000'
+    expect_refusal "Error: $TESTDB is corrupt: its root page 99 is not a node page of the file." || return 1
+
+    # A length that isn't a whole number of pages is caught before the header
+    # is even read.
+    head -c 4097 /dev/zero >"$TESTDB"
+    expect_refusal "Db file is not a whole number of pages. Corrupt file."
 }
 
 t_sql_syntax_errors() {
@@ -743,7 +847,7 @@ t_duplicate_key() {
     [[ $(grep -cF '(1, user1, person1@example.com)' <<<"$out") -eq 1 ]]
 }
 
-ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split select_multilevel select_empty btree_nonroot_split btree_internal_split btree_internal_split_persists page_cache_full sql_syntax_errors sql_binding_errors sql_lexical)
+ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split select_multilevel select_empty btree_nonroot_split btree_internal_split btree_internal_split_persists large_table file_header file_rejects_foreign sql_syntax_errors sql_binding_errors sql_lexical)
 
 run_one() {
     if "t_$1"; then

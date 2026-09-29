@@ -22,6 +22,7 @@ set(MINI_SQL_SOURCES
     src/schema.c
     src/record.c
     src/table.c
+    src/file_header.c
     src/pager.c
     src/cursor.c
     src/btree.c
@@ -68,7 +69,9 @@ set(MINI_SQL_TESTS
     btree_nonroot_split
     btree_internal_split
     btree_internal_split_persists
-    page_cache_full
+    large_table
+    file_header
+    file_rejects_foreign
     sql_syntax_errors
     sql_binding_errors
     sql_lexical

@@ -29,8 +29,8 @@
  * Leaf node header: the common header, a 4-byte cell count, then the page
  * number of the next leaf to the right. Following next_leaf from the leftmost
  * leaf visits every row in key order, which is how a scan crosses leaves. Zero
- * means "no right sibling": page 0 always holds the root, which is never anyone's
- * sibling, so it is free to serve as the sentinel.
+ * means "no right sibling": page 0 is the file header and never a node, so it
+ * is free to serve as the sentinel.
  */
 #define LEAF_NODE_NUM_CELLS_OFFSET COMMON_NODE_HEADER_SIZE
 #define LEAF_NODE_NEXT_LEAF_OFFSET (COMMON_NODE_HEADER_SIZE + 4u)
@@ -85,10 +85,10 @@
 
 /*
  * The page number stored in an internal node's right-child slot until a real
- * child is put there. Page 0 can't serve as "unset", since it's always the
- * root; this value is far beyond any page the pager will fetch, so following
- * it by mistake fails loudly in pager_get_page's bounds check rather than
- * quietly leading back to the root.
+ * child is put there. Page 0 can't serve as "unset": it's the file header, and
+ * following it would read the header's bytes as a node. This value lies past
+ * the end of any file, so following it by mistake fails loudly in
+ * pager_get_page's bounds check instead of quietly reading the wrong page.
  */
 #define INVALID_PAGE_NUM UINT32_MAX
 

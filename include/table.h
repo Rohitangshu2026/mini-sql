@@ -20,8 +20,10 @@ typedef struct{
 
 /*
  * Opens a database connection: opens the file through the pager and, for a
- * brand-new file, initializes page 0 as an empty root leaf. Returns a Table
- * bound to `schema`.
+ * brand-new file, writes the header on page 0 and an empty root leaf on page 1.
+ * An existing file's header is validated first, and a file this build can't
+ * read is refused with a message and an exit, untouched. Returns a Table bound
+ * to `schema`, rooted at the page the header records.
  */
 Table* db_open(const char* filename, Schema* schema);
 
