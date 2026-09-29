@@ -35,7 +35,7 @@ is in place.
 - [How the B-tree works](#how-the-b-tree-works)
 - [Command lifecycle](#command-lifecycle)
 - [The REPL state machine](#the-repl-state-machine)
-- [Insert validation](#insert-validation)
+- [Parsing and validation](#parsing-and-validation)
 - [Memory ownership](#memory-ownership)
 - [Build system](#build-system)
 - [Testing](#testing)
@@ -56,20 +56,25 @@ cmake --build build           # compile
 ctest --test-dir build        # run the test suite
 ```
 
-The binary takes the database filename as an argument. Rows are stored in key
-order whatever order they arrive in, duplicate keys are rejected, and everything
-survives a restart:
+The binary takes the database filename as an argument and reads one SQL statement
+per line. Rows are stored in key order whatever order they arrive in, duplicate
+keys are rejected, bad statements say exactly what's wrong, and everything survives
+a restart:
 
 ```text
 $ ./build/mini_sql mydb.db
-db > insert 3 carol carol@example.com
+db > INSERT INTO users VALUES (3, 'carol', 'carol@example.com');
 Executed. (0.000 ms)
-db > insert 1 alice alice@example.com
+db > INSERT INTO users VALUES (1, 'alice', 'alice@example.com');
 Executed. (0.001 ms)
-db > insert 2 bob bob@example.com
+db > INSERT INTO users (email, id, username) VALUES ('bob@example.com', 2, 'Bob Smith');
 Executed. (0.000 ms)
-db > insert 1 again again@example.com
+db > INSERT INTO users VALUES (1, 'again', 'again@example.com');
 Error: Duplicate key.
+db > INSERT INTO users VALUES ('four', 'dan', 'dan@example.com');
+Type error: column 'id' is INT, but 'four' is text.
+db > SELECT * FORM users;
+Syntax error: expected FROM near 'FORM' at column 10.
 db > .btree
 Tree:
 - leaf (size 3)
@@ -79,15 +84,17 @@ Tree:
 db > .exit
 
 $ ./build/mini_sql mydb.db
-db > select
+db > SELECT * FROM users;
 (1, alice, alice@example.com)
-(2, bob, bob@example.com)
+(2, Bob Smith, bob@example.com)
 (3, carol, carol@example.com)
 Executed. (0.008 ms)
 db > .exit
 ```
 
 `.btree` prints the tree's shape and `.constants` prints the on-page layout sizes.
+The trailing `;` is optional, keywords and names ignore case, and `--` starts a
+comment.
 
 Requirements: a C11 compiler (Apple Clang / GCC), CMake ≥ 3.20, and `bash` for the
 tests. No third-party libraries.
@@ -100,8 +107,10 @@ tests. No third-party libraries.
 | --- | --- |
 | Interactive REPL with `db >` prompt | ✅ |
 | Meta-commands: `.exit`, `.btree`, `.constants` | ✅ |
-| `insert <id> <username> <email>` into a fixed `users` schema | ✅ |
-| `select` — full scan, rows in primary-key order | ✅ |
+| **SQL front end**: tokenizer, recursive-descent parser, binder | ✅ |
+| `INSERT INTO users [(columns)] VALUES (…)` into a fixed `users` schema | ✅ |
+| `SELECT * FROM users` — full scan, rows in primary-key order | ✅ |
+| **Syntax and type errors** that name the problem and its column position | ✅ |
 | **B+ tree storage**: sorted leaves, internal routing nodes | ✅ |
 | **O(log n) lookup**: binary search per node, descending from the root | ✅ |
 | **Duplicate primary keys rejected** | ✅ |
@@ -113,7 +122,7 @@ tests. No third-party libraries.
 | Schema-driven row (de)serialization | ✅ |
 | Persistence to a single database file | ✅ |
 | Per-statement execution timing | ✅ |
-| Black-box test suite (17 CTest cases) with a B+ tree invariant checker | ✅ |
+| Black-box test suite (20 CTest cases) with a B+ tree invariant checker | ✅ |
 | More than 100 pages | ⛔ the page cache is a fixed array — 699 rows in ascending order |
 | `WHERE`, `DELETE`, `UPDATE` | ⛔ |
 | `CREATE TABLE` / multiple tables | ⛔ single hardcoded schema |
@@ -125,7 +134,8 @@ tests. No third-party libraries.
 ## Architecture at a glance
 
 The engine is a classic **front-end / back-end** split. The front end turns text
-into a validated `Statement`; the back end executes it through a cursor, which
+into a validated `Statement` in three steps — tokens, a syntax tree, then a check
+against the table's schema; the back end executes it through a cursor, which
 navigates the B-tree, which reads and writes pages through the pager.
 
 ```mermaid
@@ -139,7 +149,9 @@ flowchart TD
 
     subgraph Frontend["Front end — compile & validate"]
         META["meta_command — dot-commands"]
-        STMT["statement — tokenize + validate"]
+        STMT["statement — binder: check the tree, build the row"]
+        PARSE["parser — recursive descent into a syntax tree"]
+        TOK["tokenizer — tokens with column positions"]
     end
 
     subgraph Backend["Back end — execute & store"]
@@ -158,6 +170,8 @@ flowchart TD
     REPL --> META
     REPL --> STMT
     REPL --> EXEC
+    STMT --> PARSE
+    PARSE --> TOK
     STMT --> REC
     STMT --> SCHEMA
     EXEC --> CUR
@@ -185,8 +199,9 @@ array — the storage underneath it became a B-tree without it noticing.
 
 SQLite compiles SQL to bytecode and runs it on a virtual machine over a B-tree /
 pager stack. `mini-sql` builds that stack **bottom-up**: the pager and the B-tree
-are now genuine counterparts; the SQL-compiler half stays intentionally trivial
-(no bytecode VM — the executor runs the statement directly).
+are genuine counterparts, and so are the tokenizer and parser. Between the parser
+and the storage, a binder checks the syntax tree and the executor runs the result
+directly — there is no bytecode or VM.
 
 ```mermaid
 flowchart LR
@@ -202,9 +217,9 @@ flowchart LR
     end
     subgraph Mini["mini-sql today"]
         direction TB
-        m1["statement.c — strtok tokenizer"]
-        m2["statement.c — keyword dispatch"]
-        m3["(none — no parse tree)"]
+        m1["tokenizer.c — tokens with column positions"]
+        m2["parser.c — recursive descent into a syntax tree"]
+        m3["statement.c — binder (no bytecode)"]
         m4["executor.c + cursor.c"]
         m5["btree.c — B+ tree, splits, leaf chain"]
         m6["pager.c — file-backed page cache"]
@@ -219,17 +234,18 @@ flowchart LR
     s7 -.-> m7
 ```
 
-The backend rows are real; the code-generator row is the honest gap — see the
-[roadmap](#roadmap).
+Every row but the code generator and VM is a real counterpart. Those two are the
+honest gap: the binder produces a ready-to-run `Statement` rather than a program —
+see [limitations](#limitations--non-goals).
 
 ---
 
 ## Module dependency graph
 
-Each `.c` includes only the headers it truly needs; `pager`, `schema`, and
-`input_buffer` are the leaves. The static library `mini_sql_lib` contains every
-module except `main`, so tests and future benchmarks link against it without
-recompiling sources.
+Each `.c` includes only the headers it truly needs; `pager`, `schema`,
+`input_buffer` and `tokenizer` are the leaves. The static library `mini_sql_lib`
+contains every module except `main`, so tests and future benchmarks link against it
+without recompiling sources.
 
 ```mermaid
 flowchart BT
@@ -243,8 +259,9 @@ flowchart BT
     meta_command --> input_buffer
     meta_command --> table
     meta_command --> btree
-    statement --> input_buffer
+    statement --> parser
     statement --> record
+    parser --> tokenizer
     executor --> statement
     executor --> table
     executor --> cursor
@@ -260,20 +277,22 @@ flowchart BT
     record --> schema
 
     classDef leaf fill:#e8eefc,stroke:#5577cc;
-    class schema,input_buffer,pager leaf;
+    class schema,input_buffer,pager,tokenizer leaf;
 ```
 
 | Module | Responsibility | Key entry points |
 | --- | --- | --- |
 | `input_buffer` | Read a line of stdin into a growable buffer | `new_input_buffer`, `read_input`, `close_input_buffer` |
 | `meta_command` | Handle `.`-prefixed commands; teardown on `.exit` | `do_meta_command` |
-| `schema` | Runtime column layout: types, sizes, **computed offsets** | `schema_create`, `schema_find_column_by_id/name`, `schema_free` |
+| `tokenizer` | Split a line of SQL into tokens, each with its column | `tokenizer_init`, `tokenizer_next`, `token_type_name` |
+| `parser` | Recursive descent from tokens to a syntax tree; syntax errors | `parse_statement`, `ast_free` |
+| `schema` | Runtime column layout: types, sizes, **computed offsets**; case-insensitive name lookup | `schema_create`, `schema_find_column_by_id/name`, `schema_names_equal`, `schema_free` |
 | `record` | An opaque row payload + schema-keyed get/set + (de)serialize | `record_init`, `record_set_int/text`, `serialize_record`, `print_record` |
 | `pager` | Page cache backed by a file; allocates, reads on miss, flushes on close | `pager_open`, `pager_get_page`, `get_unused_page_num`, `pager_flush`, `pager_close` |
 | `btree` | Leaf and internal node formats, per-node binary search, leaf split and root growth, tree printer | `leaf_node_insert`, `leaf_node_find_cell`, `internal_node_find_child`, `leaf_node_next_leaf`, `print_tree` |
 | `table` | Opens/closes a database connection; creates the root leaf of a new file | `db_open`, `db_close` |
 | `cursor` | A position in a leaf; tree descent and leaf-chain traversal | `table_start`, `table_find`, `cursor_value`, `cursor_advance` |
-| `statement` | Tokenize + validate input into a `Statement` | `prepare_statement`, `statement_set_default_schema` |
+| `statement` | The binder: check a syntax tree against the table, build the row; type and name errors | `prepare_statement`, `statement_set_default_table` |
 | `executor` | Run a prepared `Statement` against a `Table` via a cursor | `execute_statement` |
 | `main` | REPL loop + wiring + lifetime management | — |
 
@@ -291,6 +310,8 @@ code actually follows):
 - `Cursor` **points into** a leaf of a `Table`; it owns nothing.
 - `Statement` **holds** a `Record` inline; `Record` is just bytes, **interpreted by**
   a `Schema`.
+- `Ast`, the parser's syntax tree, **owns** its names and literal text, and lives
+  only for the duration of `prepare_statement`.
 
 ```mermaid
 classDiagram
@@ -643,7 +664,7 @@ only moves along the leaf chain — and `cursor_value` / `cursor_advance` assert
 
 ### INSERT
 
-The parser validates **before** allocating, so a rejected insert never leaks the
+The binder validates **before** allocating, so a rejected insert never leaks the
 record payload. Execution descends to the key's leaf, checks for a duplicate there,
 and inserts — splitting the leaf if it's full.
 
@@ -651,15 +672,19 @@ and inserts — splitting the leaf if it's full.
 sequenceDiagram
     actor U as User
     participant M as main (REPL)
-    participant S as statement
+    participant S as statement (binder)
+    participant Q as parser + tokenizer
     participant E as executor
     participant C as cursor
     participant B as btree
     participant P as pager
 
-    U->>M: insert 5 eve eve@x.com
-    M->>S: prepare_statement(buf, &stmt)
-    S->>S: validate each column, then build the Record
+    U->>M: INSERT INTO users VALUES (5, 'eve', 'eve@x.com');
+    M->>S: prepare_statement(line, &stmt, &error)
+    S->>Q: parse_statement(line, &ast, &error)
+    Q-->>S: InsertAst{ users, values [5, 'eve', 'eve@x.com'] }
+    S->>S: table, value count, each value's type and size — then build the Record
+    S->>S: ast_free(&ast)
     S-->>M: PREPARE_SUCCESS
 
     M->>E: execute_statement(&stmt, table)
@@ -690,7 +715,7 @@ sequenceDiagram
     participant C as cursor
     participant R as record
 
-    U->>M: select
+    U->>M: SELECT * FROM users;
     M->>E: execute_statement(&stmt, table)
     E->>C: table_start(table) = table_find(table, 0)
     loop until cursor.end_of_table
@@ -724,7 +749,8 @@ stateDiagram-v2
     Meta --> [*] : .exit (flush pages, close file, free all)
 
     Prepare --> Execute : PREPARE_SUCCESS
-    Prepare --> Prompt : syntax / negative-id / too-long / unrecognized
+    Prepare --> Prompt : PREPARE_ERROR (print the message)
+    Prepare --> Prompt : PREPARE_EMPTY (blank line, comment, lone ';')
 
     Execute --> Prompt : EXECUTE_SUCCESS / EXECUTE_DUPLICATE_KEY
 ```
@@ -736,43 +762,81 @@ never reaches the end of `main`.
 
 ---
 
-## Insert validation
+## Parsing and validation
 
-`prepare_insert` is **schema-generic** — it loops over `schema->columns` and
-dispatches on each column's `type`. It is not hardcoded to three columns, so it will
-parse inserts for any future runtime schema unchanged. The two-pass structure
-(validate everything, *then* allocate) is what keeps the error paths leak-free.
+A line of SQL goes through three layers, each knowing only the one below it:
 
 ```mermaid
-flowchart TD
-    A["insert line"] --> B["strtok: pull 1 token per column"]
-    B --> C{token missing?}
-    C -->|yes| E1["return PREPARE_SYNTAX_ERROR"]
-    C -->|no| D{column type}
-    D -->|INT| F{value negative?}
-    F -->|yes| E2["return PREPARE_NEGATIVE_ID"]
-    F -->|no| G["stash token"]
-    D -->|TEXT| H{too long for column?}
-    H -->|yes| E3["return PREPARE_STRING_TOO_LONG"]
-    H -->|no| G
-    G --> I{more columns?}
-    I -->|yes| B
-    I -->|no| J["record_init + set every column"]
-    J --> K["return PREPARE_SUCCESS"]
+flowchart LR
+    L["line of SQL"] --> T["tokenizer<br/>tokens + column positions"]
+    T --> P["parser<br/>recursive descent → syntax tree"]
+    P --> B["binder<br/>names, counts, types → Record"]
+    B --> S["Statement"]
+    T -.->|malformed token| E1["Syntax error"]
+    P -.->|unexpected token| E1
+    B -.->|unknown name, wrong count| E2["Error"]
+    B -.->|value doesn't fit the column| E3["Type error"]
 ```
 
-| Result code | Message | Cause |
-| --- | --- | --- |
-| `PREPARE_SUCCESS` | — | well-formed insert |
-| `PREPARE_SYNTAX_ERROR` | `Syntax error. Could not parse statement.` | too few tokens |
-| `PREPARE_NEGATIVE_ID` | `ID must be positive.` | an `INT` column got a negative value |
-| `PREPARE_STRING_TOO_LONG` | `String is too long.` | a `TEXT` value exceeds the column width |
-| `PREPARE_UNRECOGNIZED_STATEMENT` | `Unrecognized keyword …` | not `insert`/`select` |
-| `EXECUTE_DUPLICATE_KEY` | `Error: Duplicate key.` | a row with that id already exists |
+The parser knows nothing about schemas — a table name is just text to it — which is
+what will let the catalog re-parse a stored `CREATE TABLE` before the table exists.
+The binder knows nothing about token positions.
 
-> Note: "negative id" is currently generalized to *any* `INT` column. That is a
-> pragmatic stand-in until per-column constraints (PRIMARY KEY / UNSIGNED) exist —
-> see [design decisions](#design-decisions).
+**Tokens.** The lexical rules cover every statement the engine is planned to
+support, so later stages only add grammar:
+
+| Class | Rule |
+| --- | --- |
+| Keywords (any case, reserved) | `SELECT INSERT INTO VALUES FROM WHERE CREATE TABLE DELETE AND OR NOT PRIMARY KEY INT TEXT EXPLAIN` |
+| Identifier | `[A-Za-z_][A-Za-z0-9_]*`, not a keyword; compared ignoring case |
+| Integer | `[0-9]+`; digits running into letters (`7x`) are a malformed number; overflow is flagged, never computed |
+| String | `'…'`, with `''` for a quote inside it |
+| Symbols | `( ) , ; * -` and `= != <> < <= > >=` |
+| Skipped | spaces, tabs, `\r`, and `-- comments` to the end of the line |
+
+**Grammar**, one parser function per rule:
+
+```text
+statement := [ insert | select ] [ ';' ] END
+insert    := INSERT INTO name [ '(' name { ',' name } ')' ] VALUES '(' literal { ',' literal } ')'
+select    := SELECT '*' FROM name
+literal   := [ '-' ] INTEGER | STRING
+```
+
+The parser stops at the first error and frees whatever it had built. Anything after
+a complete statement — a second statement, or a clause that isn't supported yet —
+is a syntax error, not something to ignore.
+
+**Binding.** The binder's checks run from the statement's shape down to single
+values, so the error reported is the most basic thing wrong, and every check runs
+before the row is allocated:
+
+1. the table exists;
+2. a column list, if given, names only real columns, each once;
+3. there are as many values as columns;
+4. a column list leaves no column out — there are no NULLs or defaults;
+5. each value fits its column: INT takes an integer within int32 that isn't
+   negative, TEXT(n) takes a string of at most n bytes.
+
+Every message carries its category:
+
+| Input | Message |
+| --- | --- |
+| `SELECT * FORM users` | `Syntax error: expected FROM near 'FORM' at column 10.` |
+| `… VALUES (1, 'bob)` | `Syntax error: unterminated string starting at column 30.` |
+| `… VALUES (7x, …)` | `Syntax error: malformed number '7x' at column 27.` |
+| `SELECT * FROM users junk` | `Syntax error: expected end of statement near 'junk' at column 21.` |
+| `INSERT INTO orders …` | `Error: no such table: orders.` |
+| `… (id, email) VALUES (1, 'a@b')` | `Error: column 'username' has no value.` |
+| `… VALUES (1, 'bob')` | `Error: 2 values for 3 columns.` |
+| `… VALUES ('abc', …)` | `Type error: column 'id' is INT, but 'abc' is text.` |
+| `… VALUES (3000000000, …)` | `Type error: 3000000000 is out of range for INT column 'id'.` |
+| a 33-byte username | `Type error: column 'username' is TEXT(32), but the value is 33 bytes.` |
+| `… VALUES (-1, …)` | `Error: column 'id' must not be negative.` |
+| an id that's already stored | `Error: Duplicate key.` (from the executor) |
+
+> Note: the "not negative" rule applies to every `INT` column for now. It narrows to
+> the primary key once `CREATE TABLE` can declare one.
 
 ---
 
@@ -791,6 +855,7 @@ flowchart TD
     pager ==>|owns| pagesfd["page cache + open fd"]
     table -.->|borrows| schema
     stmt ==>|owns: record_init| payload["Record.payload"]
+    prep["prepare_statement"] ==>|owns, frees before returning| ast["Ast: names + literal text"]
 ```
 
 Legend: **thick arrow = owns/frees**, **dotted arrow = borrows or stack**.
@@ -807,6 +872,10 @@ Lifecycle rules:
 - `db_close` is the single teardown path: it flushes every cached page, then
   `pager_close` (closes the fd + frees the cache), then `schema_free`, then frees the
   table. `.exit` is the only caller.
+- `prepare_statement` owns the syntax tree for exactly one call: the parser frees a
+  partly built tree itself when it hits an error, and `prepare_statement` frees a
+  complete one after binding, whether binding succeeded or not. Everything the
+  executor needs is copied into the `Statement` first.
 - Each REPL iteration zero-initializes `Statement statement = {0}` and calls
   `record_free` after execution — a no-op for `select` (NULL payload), the real free
   for `insert`. The `Cursor` is `malloc`'d per statement and freed at the end of
@@ -824,6 +893,8 @@ flowchart LR
     subgraph src["MINI_SQL_SOURCES"]
         a[input_buffer.c]
         b[meta_command.c]
+        k[tokenizer.c]
+        l[parser.c]
         c[statement.c]
         d[executor.c]
         e[schema.c]
@@ -877,11 +948,14 @@ Every case receives both binaries. The internal-split cases drive the 3-key test
 build, and first check through `.constants` that it really got that build; the
 rest drive the real `mini_sql`.
 
-The 17 cases:
+The 20 cases:
 
 | Area | Cases |
 | --- | --- |
-| Basics | insert/select round trip; max-length strings; over-length strings; negative id |
+| Basics | insert/select round trip; max-length strings; over-length strings in either column; negative id |
+| SQL syntax | every syntax error, with its exact message and column: misspelled and missing keywords, unterminated strings, malformed numbers, stray characters, trailing tokens, unsupported clauses, reserved words as names, the tutorial's old syntax, and long tokens cut short in the message; none of them changes the table |
+| Binding | unknown table and column, a column listed twice or left out, the wrong number of values, text in an INT column and an integer in a TEXT one, INT range edges (2147483647 and -0 accepted; 2147483648, -2147483649 and a 23-digit number rejected), negative values |
+| Lexical rules | keywords and names in any case, reordered column lists, `''` inside strings, text holding spaces, commas, semicolons and `--`, tabs and extra whitespace, optional `;`, comments, silent blank lines, and a final line with no newline |
 | Persistence | rows survive a reopen |
 | Layout | `.constants` pins every size and offset, and the real 510-key internal capacity |
 | Tree shape | one sorted leaf; a root split under four insertion orders; the split survives a reopen; inserts routed left and right after the split, including a key equal to the separator; four-leaf trees from splits below the root under ascending, descending and the tutorial's pseudorandom order, surviving a reopen |
@@ -923,9 +997,17 @@ How the suite earns its trust:
       and all
     - its parent-pointer overwrite misfiles a subtree under the scrambled insertion
       order, which only the invariant checker notices
+- **Front-end mutation checks.** Matching keywords case-sensitively, leaving `''`
+  unescaped, ignoring trailing tokens, skipping the binder's type check, lexing `7x`
+  as `7`, and cutting the last byte of an unterminated final line each fail a test.
 - **Sanitizers.** The B-tree stages were each run under AddressSanitizer and
   UndefinedBehaviorSanitizer, which is what surfaced the misaligned loads in the
   tutorial's node layout.
+- **Fuzzing and leak checks for the front end.** 20,000 lines of random token soup
+  and byte-level mutations of valid statements ran through the sanitized binary
+  without a single report, and `leaks --atExit` finds nothing after a script that
+  hits every kind of error — including the partly built syntax trees freed on the
+  way out.
 - **Timeouts.** Scans follow on-disk pointers, so each test has a 10-second limit
   that turns a pointer cycle into a fast failure instead of a hang.
 
@@ -986,9 +1068,19 @@ implements the feature deliberately flips the test.
 **Address columns by stable `column_id`.** Never by name or ordinal. `RENAME` becomes
 a metadata edit; `DROP` becomes a flag; neither disturbs other columns' data.
 
-**Validate before allocate.** `prepare_insert` proves the whole line is valid before
+**Parse, then bind.** The parser turns text into a syntax tree without knowing any
+schema; the binder checks that tree against the table. Syntax errors and schema
+errors come from different layers with different information — a token's column,
+or a column's type — and the parser can read a statement about a table that
+doesn't exist yet, which the catalog will need.
+
+**Validate before allocate.** The binder proves the whole statement is valid before
 calling `record_init`. Early returns can't leak, and there's no half-built record to
 unwind.
+
+**One error, the first one.** The parser stops at the first unexpected token, and
+the binder checks from the statement's shape down to single values. The message
+names the most basic problem rather than a cascade of consequences.
 
 **`%.*s`, not `%s`, when printing text.** A maximum-width text field has no room for a
 NUL terminator. Bounding the print to `column->size` means `mini-sql` never had the
@@ -1002,6 +1094,7 @@ NUL terminator. Bounding the print to `column->size` means `mini-sql` never had 
 | The tutorial | mini-sql | Why it matters |
 | --- | --- | --- |
 | A fixed `Row` struct with compile-time offsets | A runtime `Schema` computes every offset | `CREATE TABLE` / `ALTER TABLE` stay possible |
+| `insert 1 user email` split on spaces (`sscanf`, later `strtok`), with a few fixed error messages | SQL through a tokenizer, a recursive-descent parser and a binder, with errors that name the problem and its column | Text can hold spaces and quotes; `insert abc …` is an error, not id 0 |
 | Row text buffers need a `+1` for the NUL | Width-bounded printing (`%.*s`) | No struct, so the max-length-string bug never existed |
 | Packed 6-byte node header | Aligned 8-byte header, 4-byte-multiple cells | `uint32_t` loads are UBSan-clean |
 | The leaf split writes the new row at the start of the cell and never writes its key | Key and row go into their own slots | The corruption the tutorial discovers two parts later never happened here |
@@ -1022,46 +1115,51 @@ NUL terminator. Bounding the print to `column->size` means `mini-sql` never had 
 
 ## Roadmap
 
-Built bottom-up so something runs at every step. Storage-engine priorities
-(pager, B-tree) come before query-language breadth.
+Built bottom-up so something runs at every step. The tutorial's storage engine is
+finished; what follows grows it into a small SQL database in six stages, each with
+its own design review.
 
 ```mermaid
 flowchart LR
-    A["1–6 · REPL → pager → cursor"] --> B["7–12 · B-tree: format, search, split, scan"]
-    B --> C["13 · update parent after a split"]
-    C --> D["14 · split internal nodes"]
-    D --> E["WHERE / DELETE"]
-    E --> F["catalog"]
-    F --> G["CREATE / ALTER TABLE"]
+    A["tutorial 1–14 · REPL, pager, cursor, B+ tree"] --> S1["1 · SQL tokenizer + parser"]
+    S1 --> S2["2 · storage: growable pager, file header"]
+    S2 --> S3["3 · catalog, CREATE TABLE, many tables"]
+    S3 --> S4["4 · typed WHERE, range scans, EXPLAIN"]
+    S4 --> S5["5 · DELETE with rebalancing"]
+    S5 --> S6["6 · error audit, benchmark"]
 
     classDef done fill:#d6f5d6,stroke:#3a9a3a;
     classDef now fill:#fff2cc,stroke:#bba12a;
     classDef todo fill:#eeeeee,stroke:#999999;
 
-    class A,B,C,D done;
-    class E now;
-    class F,G todo;
+    class A,S1 done;
+    class S2 now;
+    class S3,S4,S5,S6 todo;
 ```
 
-- **Done — storage foundations (1–6):** REPL, schema-driven rows, tests, a
-  file-backed pager, and the cursor abstraction.
-- **Done — B-tree (7–14), the whole of the tutorial:** sorted leaves with binary
-  search, duplicate-key rejection, leaf splits that grow a new root, descent through
-  internal nodes, leaf-chain scans, splits below the root that update their parent,
-  and internal-node splits that cascade up to a new root.
-- **Next — `WHERE` and `DELETE`:** a point lookup is `table_find` plus one cell; a
-  range scan is `table_find(low)` plus a walk along the leaf chain. Deletion is the
-  inverse of this stage's work: merging or borrowing between siblings, shrinking
-  separators, and collapsing the root.
-- **Then — catalog + DDL:** a name→table registry, then runtime `CREATE TABLE` and the
-  `ALTER TABLE ADD/DROP/RENAME COLUMN` family the schema layer was designed for.
-- **Worth doing before storing anything that matters:** a versioned file header, so
-  a file written by an older format is rejected cleanly instead of misread.
-- **Worth doing before storing anything large:** a page cache that evicts or grows,
-  lifting the 100-page ceiling. That's also what lets the real binary reach an
-  internal split: a 510-key node isn't full until it has 511 children. Dropping
-  on-disk parent pointers for a path kept by the cursor, as SQLite does, would then
-  save a split from fetching every child it moves.
+- **Done — the tutorial (1–14):** REPL, schema-driven rows, a file-backed pager, the
+  cursor abstraction, and the whole B+ tree: sorted leaves with binary search,
+  duplicate-key rejection, splits at every level cascading up to a new root, and
+  leaf-chain scans.
+- **Done — Stage 1, SQL front end:** a tokenizer, a recursive-descent parser and a
+  binder for `INSERT` and `SELECT *`, with syntax and type errors that say what and
+  where.
+- **Next — Stage 2, storage foundation:** a page table that grows instead of stopping
+  at 100 pages, and a versioned header on page 0 that rejects files from older
+  builds cleanly. With the page limit gone, the real binary reaches its first
+  510-key internal split.
+- **Stage 3 — catalog and `CREATE TABLE`:** the catalog is itself a B-tree table
+  holding each table's name, root page and `CREATE TABLE` text, re-parsed on open.
+  Many tables share one file; the hardcoded `users` table goes away.
+- **Stage 4 — `SELECT` column lists, typed `WHERE`, range scans:** conditions on the
+  primary key become a point lookup or a seek plus a bounded walk along the leaf
+  chain, and `EXPLAIN` shows which plan was chosen.
+- **Stage 5 — `DELETE`:** borrowing from and merging with siblings, collapsing the
+  root, and reusing freed pages, so the tree stays balanced.
+- **Stage 6 — error audit and presentation:** every storage failure reports an error
+  instead of ending the process, plus a benchmark of lookups against scans.
+- **Later, perhaps:** dropping on-disk parent pointers for a path kept by the cursor,
+  as SQLite does, which would save a split from fetching every child it moves.
 
 ---
 
@@ -1073,17 +1171,21 @@ mini-sql/
 ├── include/
 │   ├── input_buffer.h      # line reader
 │   ├── meta_command.h      # dot-commands
+│   ├── tokenizer.h         # TokenType, Token, Tokenizer
+│   ├── parser.h            # syntax tree (Ast, Literal), SqlError, parse_statement
 │   ├── schema.h            # ColumnType, ColumnDefinition, Schema
 │   ├── record.h            # Record + (de)serialization
 │   ├── pager.h             # Pager, page cache constants, page allocation
 │   ├── btree.h             # node formats, search, insert/split, tree printer
 │   ├── table.h             # Table + db_open / db_close
 │   ├── cursor.h            # Cursor + start/find/value/advance
-│   ├── statement.h         # Statement, PrepareResult
+│   ├── statement.h         # Statement, PrepareResult, the binder's entry point
 │   └── executor.h          # ExecuteResult, execute_statement
 ├── src/
 │   ├── input_buffer.c
 │   ├── meta_command.c
+│   ├── tokenizer.c
+│   ├── parser.c
 │   ├── schema.c
 │   ├── record.c
 │   ├── pager.c
@@ -1115,10 +1217,12 @@ This is a learning engine. Known gaps, most of them on the [roadmap](#roadmap):
 - **File-format stability** — the page layout has changed several times on the way
   here and isn't versioned, so a database file from an earlier build is unreadable.
   Delete and recreate it.
-- **A real SQL dialect** — `insert`/`select` only, fixed positional syntax, one
-  hardcoded `users` table, no `WHERE` / `UPDATE` / `DELETE` / joins.
-- **A bytecode VM** — the executor runs statements directly; there is no parse tree,
-  no code generator, no VDBE.
+- **A small SQL dialect** — so far `INSERT` and `SELECT *` on one hardcoded `users`
+  table, one statement per line, INT and TEXT(n) columns only, no NULLs or defaults.
+  `WHERE` and `DELETE` are on the roadmap; `UPDATE`, joins and subqueries are not.
+  The keywords are reserved, so a table or column can't be named `key` or `text`.
+- **A bytecode VM** — the binder hands the executor a ready-to-run statement; there
+  is no code generator and no VDBE.
 - **Concurrent** — single-threaded, no locking.
 
 The aim is a correct, legible core that grows one well-understood layer at a time.
