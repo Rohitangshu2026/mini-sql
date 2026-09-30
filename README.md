@@ -37,6 +37,7 @@ Every part of the tutorial's storage engine is in place.
 - [Command lifecycle](#command-lifecycle)
 - [The REPL state machine](#the-repl-state-machine)
 - [Parsing and validation](#parsing-and-validation)
+- [Query planning](#query-planning)
 - [Memory ownership](#memory-ownership)
 - [Build system](#build-system)
 - [Testing](#testing)
@@ -104,6 +105,31 @@ CREATE TABLE orders (total INT, id INT PRIMARY KEY, note TEXT(40));
 db > .exit
 ```
 
+`SELECT` takes a column list and a typed `WHERE`. Conditions on the primary key
+become a point lookup or a range scan that reads only the rows it needs — `EXPLAIN`
+shows the plan, and `.stats` how many rows the last `SELECT` read. On a table of
+1,000 users:
+
+```text
+db > SELECT username, id FROM users WHERE id > 500 AND id <= 503;
+(user501, 501)
+(user502, 502)
+(user503, 503)
+Executed. (0.003 ms)
+db > .stats
+Rows examined: 3
+db > SELECT id FROM users WHERE username = 'user42';
+(42)
+Executed. (0.183 ms)
+db > .stats
+Rows examined: 1000
+db > EXPLAIN SELECT * FROM users WHERE id >= 10 AND id < 20 AND username != 'x';
+SEARCH users USING PRIMARY KEY (id >= 10 AND id <= 19)
+Executed. (0.000 ms)
+db > SELECT * FROM users WHERE id = 'ten';
+Type error: cannot compare INT column 'id' with 'ten'.
+```
+
 `.tables` lists the tables and `.schema [TABLE]` prints their definitions;
 `.btree TABLE` prints a table's tree and `.constants [TABLE]` the on-page layout
 sizes. The trailing `;` is optional, keywords and names ignore case, and `--`
@@ -119,12 +145,15 @@ tests. No third-party libraries.
 | Capability | Status |
 | --- | --- |
 | Interactive REPL with `db >` prompt | ✅ |
-| Meta-commands: `.exit`, `.tables`, `.schema`, `.btree`, `.constants` | ✅ |
+| Meta-commands: `.exit`, `.tables`, `.schema`, `.btree`, `.constants`, `.stats` | ✅ |
 | **SQL front end**: tokenizer, recursive-descent parser, binder | ✅ |
 | **`CREATE TABLE`** with INT and TEXT(n) columns and an INT PRIMARY KEY, validated | ✅ |
 | **Any number of tables** in one file, listed in a catalog that is itself a table | ✅ |
 | `INSERT INTO t [(columns)] VALUES (…)` | ✅ |
-| `SELECT * FROM t` — full scan, rows in primary-key order | ✅ |
+| `SELECT * \| col, … FROM t` — rows in primary-key order | ✅ |
+| **Typed `WHERE`**: `= != <> < <= > >=`, `AND` / `OR` / `NOT`, parentheses | ✅ |
+| **Point lookups and range scans** on the primary key, planned from the `WHERE` | ✅ |
+| **`EXPLAIN`** for the chosen plan, **`.stats`** for rows read | ✅ |
 | **Syntax, type and schema errors** that name the problem and, for syntax, its column | ✅ |
 | **B+ tree storage**: sorted leaves, internal routing nodes | ✅ |
 | **O(log n) lookup**: binary search per node, descending from the root | ✅ |
@@ -139,8 +168,9 @@ tests. No third-party libraries.
 | **Page cache that grows with the file** — no page limit | ✅ |
 | **Versioned file header**: foreign, older or corrupt files are refused, never misread | ✅ |
 | Per-statement execution timing | ✅ |
-| Black-box test suite (26 CTest cases) with a B+ tree invariant checker | ✅ |
-| `WHERE`, `DELETE`, `UPDATE` | ⛔ |
+| Black-box test suite (30 CTest cases) with a B+ tree invariant checker | ✅ |
+| `DELETE`, `UPDATE` | ⛔ |
+| `ORDER BY`, `LIMIT`, aggregates, secondary indexes | ⛔ |
 | `DROP TABLE`, `ALTER TABLE` | ⛔ |
 | Crash safety (journal / WAL) | ⛔ flush happens only on clean `.exit` |
 
@@ -167,12 +197,14 @@ flowchart TD
         META["meta_command — dot-commands"]
         STMT["statement — binder: tables, columns, values"]
         DEF["table_definition — CREATE TABLE checks + canonical SQL"]
+        EXPR["expression — typed WHERE: bind + evaluate"]
+        PLAN["planner — key range from the WHERE"]
         PARSE["parser — recursive descent into a syntax tree"]
         TOK["tokenizer — tokens with column positions"]
     end
 
     subgraph Backend["Back end — execute & store"]
-        EXEC["executor — insert / select / create"]
+        EXEC["executor — insert / planned select / create"]
         DB["database — file, catalog, open tables"]
         CAT["catalog — the table of tables"]
         TABLE["table — one B-tree: schema, key, root"]
@@ -193,10 +225,14 @@ flowchart TD
     STMT --> PARSE
     STMT --> DEF
     STMT --> DB
+    STMT --> EXPR
+    STMT --> PLAN
+    PLAN --> EXPR
     PARSE --> TOK
     DEF --> PARSE
     DEF --> SCHEMA
     EXEC --> DB
+    EXEC --> EXPR
     EXEC --> CUR
     META --> DB
     DB --> CAT
@@ -268,7 +304,10 @@ see [limitations](#limitations--non-goals).
 
 The catalog follows SQLite's `sqlite_schema` closely: a table holding each table's
 name, root page and `CREATE TABLE` text, which is parsed again every time the
-database is opened.
+database is opened. The planner is a small cousin of SQLite's: with only the
+primary key's B-tree to use, it chooses between a lookup, a range and a scan, and
+`EXPLAIN` reports the choice in SQLite's `SEARCH … USING PRIMARY KEY` / `SCAN`
+wording.
 
 ---
 
@@ -293,11 +332,20 @@ flowchart BT
     executor --> statement
     executor --> database
     executor --> cursor
+    executor --> expression
+    executor --> planner
     statement --> database
     statement --> parser
     statement --> record
     statement --> table
     statement --> table_definition
+    statement --> expression
+    statement --> planner
+    planner --> expression
+    planner --> table
+    expression --> parser
+    expression --> record
+    expression --> schema
     database --> catalog
     database --> table
     database --> table_definition
@@ -344,17 +392,19 @@ doesn't include `cursor.h` — so it compiles in any order.
 | `tokenizer` | Split a line of SQL into tokens, each with its column | `tokenizer_init`, `tokenizer_next`, `token_type_name` |
 | `parser` | Recursive descent from tokens to a syntax tree; syntax errors | `parse_statement`, `ast_free` |
 | `schema` | Runtime column layout: types, sizes, **computed offsets**; case-insensitive name lookup | `schema_create`, `schema_find_column_by_id/name`, `schema_names_equal`, `schema_free` |
-| `record` | An opaque row payload + schema-keyed get/set + (de)serialize | `record_init`, `record_set_int/text`, `serialize_record`, `print_record` |
+| `record` | An opaque row payload + schema-keyed get/set + (de)serialize; prints all or chosen columns | `record_init`, `record_set_int/text`, `serialize_record`, `print_record`, `print_record_columns` |
 | `pager` | Growable page cache backed by a file; allocates zeroed pages, reads on miss, flushes on close | `pager_open`, `pager_get_page`, `get_unused_page_num`, `pager_flush`, `pager_close` |
 | `file_header` | Page 0's layout: writes a new header, validates an existing one, reads the catalog root | `file_header_initialize`, `file_header_validate`, `file_header_catalog_root_page` |
 | `btree` | Leaf and internal node formats, per-node binary search, splits, tree printer, row-size limit | `leaf_node_insert`, `leaf_node_find_cell`, `internal_node_find_child`, `leaf_node_max_row_size`, `print_tree` |
 | `table_definition` | Checks a parsed `CREATE TABLE` and builds its schema, key column and canonical SQL | `table_definition_from_ast`, `table_definition_free` |
 | `table` | One table: its B-tree root, schema, key column and definition; inserts a row by key | `table_create`, `table_insert`, `table_free` |
 | `catalog` | The table of tables: its own definition in SQL, adding and reading entries | `catalog_open`, `catalog_add`, `catalog_load` |
-| `database` | Opens a file (new, or checked and loaded from its catalog), creates and finds tables, closes | `db_open`, `db_close`, `database_find_table`, `database_create_table` |
-| `cursor` | A position in a leaf; tree descent and leaf-chain traversal | `table_start`, `table_find`, `cursor_value`, `cursor_advance` |
-| `statement` | The binder: resolve tables and columns, check values and definitions; type and schema errors | `prepare_statement`, `statement_free` |
-| `executor` | Run a prepared `Statement`: insert, scan, or create a table | `execute_statement` |
+| `database` | Opens a file (new, or checked and loaded from its catalog), creates and finds tables, remembers rows read for `.stats`, closes | `db_open`, `db_close`, `database_find_table`, `database_create_table` |
+| `cursor` | A position in a leaf; tree descent and leaf-chain traversal | `table_start`, `table_find`, `cursor_key`, `cursor_value`, `cursor_advance` |
+| `expression` | Bind a `WHERE` to a table (names, types) and evaluate it against a row | `expression_bind`, `expression_evaluate`, `expression_free` |
+| `planner` | Turn conditions on the primary key into a point lookup, a range, nothing, or a scan; describe it | `plan_select`, `plan_describe` |
+| `statement` | The binder: resolve tables and columns, bind the `WHERE`, plan, check values and definitions | `prepare_statement`, `statement_free` |
+| `executor` | Run a prepared `Statement`: insert, planned select (or its `EXPLAIN`), or create a table | `execute_statement` |
 | `main` | REPL loop + wiring + lifetime management | — |
 
 ---
@@ -885,29 +935,38 @@ sequenceDiagram
 
 ### SELECT
 
-A full scan: a cursor starts at the leftmost leaf and walks the leaf chain,
-deserializing and printing each row until `end_of_table`.
+The binder resolves the column list and binds the `WHERE`, and the planner decides
+how to read the table. Execution then starts a cursor where the plan says — the
+first leaf for a scan, the low end of the key range otherwise — and walks the leaf
+chain, stopping past the high end. Every row read is checked against the whole
+`WHERE`, and the rows that pass print their chosen columns.
 
 ```mermaid
 sequenceDiagram
     actor U as User
     participant M as main
+    participant S as statement (binder)
+    participant X as expression
+    participant L as planner
     participant E as executor
     participant C as cursor
-    participant R as record
 
-    U->>M: SELECT * FROM users;
+    U->>M: SELECT username FROM users WHERE id > 10 AND id <= 20 AND username != 'x';
+    M->>S: prepare_statement(db, line, &stmt, &error)
+    S->>S: users ✓, column list → [username]
+    S->>X: expression_bind(where, schema)
+    X-->>S: every comparison typed: INT vs INT, TEXT vs TEXT
+    S->>L: plan_select(where, key column)
+    L-->>S: RANGE [11, 20]
     M->>E: execute_statement(&stmt, db)
-    E->>C: table_start(users) = table_find(users, 0)
-    loop until cursor.end_of_table
-        E->>C: cursor_value(cursor)
-        C-->>E: pointer to the row in the leaf page
-        E->>R: deserialize_record + print_record + record_free
-        E->>C: cursor_advance(cursor)
-        Note over C: past the last cell? follow next_leaf
+    E->>C: table_find(users, 11) — one descent
+    loop until the key passes 20
+        E->>C: cursor_key, cursor_value
+        E->>X: expression_evaluate(where, row)
+        E->>E: count the row, and print (username) if it holds
+        E->>C: cursor_advance — along the leaf chain
     end
-    E-->>M: EXECUTE_SUCCESS
-    M-->>U: (rows in key order…) + Executed.
+    E-->>M: EXECUTE_SUCCESS — .stats will say 10
 ```
 
 On `.exit`, `db_close` flushes every cached page to the file — that's when the data
@@ -926,7 +985,7 @@ stateDiagram-v2
     Classify --> Meta : line starts with '.'
     Classify --> Prepare : otherwise
 
-    Meta --> Prompt : .tables / .schema / .btree / .constants / unrecognized
+    Meta --> Prompt : .tables / .schema / .btree / .constants / .stats / unrecognized
     Meta --> [*] : .exit (flush pages, close file, free all)
 
     Prepare --> Execute : PREPARE_SUCCESS
@@ -978,17 +1037,28 @@ support, so later stages only add grammar:
 **Grammar**, one parser function per rule:
 
 ```text
-statement  := [ insert | select | create ] [ ';' ] END
+statement  := [ EXPLAIN ] ( insert | select | create ) [ ';' ] END   (EXPLAIN only before select)
 insert     := INSERT INTO name [ '(' name { ',' name } ')' ] VALUES '(' literal { ',' literal } ')'
-select     := SELECT '*' FROM name
+select     := SELECT ( '*' | name { ',' name } ) FROM name [ WHERE expr ]
 create     := CREATE TABLE name '(' column_def { ',' column_def } ')'
 column_def := name ( INT | TEXT '(' INTEGER ')' ) [ PRIMARY KEY ]
+expr       := and_expr { OR and_expr }
+and_expr   := not_expr { AND not_expr }
+not_expr   := NOT not_expr | primary
+primary    := '(' expr ')' | operand compare_op operand
+operand    := name | literal
+compare_op := '=' | '!=' | '<>' | '<' | '<=' | '>' | '>='
 literal    := [ '-' ] INTEGER | STRING
 ```
 
+`NOT` binds tightest, then `AND`, then `OR`. An `AND` or `OR` node keeps a list of
+its operands, so a long chain stays one level deep; `NOT` and parentheses may nest
+64 levels, and a 65th is refused (`Syntax error: expression nested too deeply at
+column N.`) rather than recursing until the stack runs out.
+
 The parser stops at the first error and frees whatever it had built. Anything after
-a complete statement — a second statement, or a clause that isn't supported yet —
-is a syntax error, not something to ignore.
+a complete statement — a second statement, or a clause that isn't supported — is a
+syntax error, not something to ignore.
 
 **Binding.** The binder's checks run from the statement's shape down to single
 values, so the error reported is the most basic thing wrong, and every check runs
@@ -1001,6 +1071,14 @@ before the row is allocated:
 5. each value fits its column: INT takes an integer within int32 — which, for
    the key column, can't be negative — and TEXT(n) takes a string of at most n
    bytes.
+
+**Queries.** A `SELECT`'s column list must name real columns (repeats allowed).
+Every comparison in its `WHERE` must have the same type on both sides — a column's
+declared type, or a literal's own. Columns can be compared with each other and
+literals with literals. INT values compare in 64 bits, so `id < 3000000000` holds
+for every row rather than being an error; TEXT compares byte by byte and
+case-sensitively, with a stored value ending at its first zero byte or at its
+column's width, so `'n10' < 'n9'`.
 
 **Defining tables.** `CREATE TABLE` is checked in the same spirit, most basic
 problem first. The name must be free — the one check that needs the database —
@@ -1035,6 +1113,62 @@ Every message carries its category:
 | `… VALUES (-1, …)` | `Error: column 'id' must not be negative.` |
 | an id that's already stored | `Error: Duplicate key.` (from the executor) |
 | `CREATE TABLE t (id INT(4) PRIMARY KEY)` | `Syntax error: expected ',' or ')' near '(' at column 23.` |
+| `SELECT nick FROM users` | `Error: no such column: nick.` |
+| `… WHERE id = 'abc'` | `Type error: cannot compare INT column 'id' with 'abc'.` |
+| `… WHERE id = username` | `Type error: cannot compare INT column 'id' with TEXT column 'username'.` |
+| `… WHERE id = 99999999999999999999` | `Type error: 99999999999999999999 is out of range for comparison with INT column 'id'.` |
+| `… WHERE id 5` | `Syntax error: expected a comparison operator near '5' at column 30.` |
+| `EXPLAIN INSERT …` | `Syntax error: expected SELECT near 'INSERT' at column 9.` |
+
+---
+
+## Query planning
+
+The only index is each table's primary-key B-tree, so a `SELECT` has four ways to
+read its table. The planner picks one from the conditions on the key that the whole
+`WHERE` depends on — the comparisons at its top level of `AND`s, in either order
+(`5 < id` is read as `id > 5`) — narrowing an inclusive range that starts as every
+possible key, `[0, 2147483647]`:
+
+```mermaid
+flowchart TD
+    W["WHERE"] --> P["split on the top-level ANDs"]
+    P --> K{"a comparison of the key with an integer?"}
+    K -->|"= > >= < <="| N["narrow [low, high]"]
+    K -->|"!=, OR, NOT, another column"| R["no effect — checked per row"]
+    N --> D{"what's left?"}
+    R --> D
+    D -->|"low > high"| EMPTY["EMPTY — read nothing"]
+    D -->|"low = high"| POINT["POINT — one descent"]
+    D -->|"still every key"| SCAN["SCAN — every row"]
+    D -->|"otherwise"| RANGE["RANGE — descend to low, walk the leaf chain to high"]
+```
+
+A range starts where one descent for `low` lands: the first key at or above it. That
+rests on the separator invariant — each separator equals the largest key on its left
+— which `btree_check` enforces and deletion will have to keep. The walk then follows
+`next_leaf` and stops at the first key past `high` without decoding it.
+
+**The whole `WHERE` is still checked against every row read.** The range only decides
+which rows are read, so `id > 990 AND username != 'x'` reads keys 991 onwards and
+filters them, and conditions under `OR` or `NOT`, or on other columns, stay correct.
+
+`EXPLAIN` prints the plan with its real bounds, and `.stats` how many rows the last
+`SELECT` read — matching or not:
+
+| `WHERE` | `EXPLAIN` | Rows read (1,000 rows) |
+| --- | --- | ---: |
+| *(none)* | `SCAN users` | 1,000 |
+| `id = 500` | `SEARCH users USING PRIMARY KEY (id = 500)` | 1 |
+| `id > 10 AND id <= 20` | `SEARCH users USING PRIMARY KEY (id >= 11 AND id <= 20)` | 10 |
+| `id > 990 AND username != 'x'` | `SEARCH users USING PRIMARY KEY (id >= 991)` | 10 |
+| `id > 5 AND id < 3` | `SEARCH users USING PRIMARY KEY (no row can match)` | 0 |
+| `id = 5 OR id = 6` | `SCAN users` | 1,000 |
+| `username = 'user7'` | `SCAN users` | 1,000 |
+
+Bounds are worked in 64 bits and clamped to the keys that can exist, so `id < -5`
+can match nothing, `id < 3000000000` doesn't narrow anything, and `id >= 2147483647`
+is a point lookup.
 
 ---
 
@@ -1056,6 +1190,7 @@ flowchart TD
     tparts ==>|Schema owns: malloc + strdup| cols["columns[] + names"]
     stmt ==>|owns: record_init| payload["Record.payload"]
     stmt ==>|owns until executed| def["TableDefinition"]
+    stmt ==>|owns: SELECT| sel["column ids + bound WHERE"]
     def -.->|handed over by table_create| tables
     prep["prepare_statement"] ==>|owns, frees before returning| ast["Ast: names + literal text"]
 ```
@@ -1070,6 +1205,9 @@ Lifecycle rules:
   on page 0 and an empty catalog on page 1; for an existing one it validates the
   header and every catalog entry, and exits without writing anything if the file
   isn't one it can read.
+- A `SELECT`'s column list and bound `WHERE` belong to its `Statement`; the plan
+  is a plain value. `statement_free` releases them. Binding a `WHERE` that fails
+  partway frees what it had bound before returning.
 - A `TableDefinition` belongs to its `Statement` until `database_create_table`
   hands its name, schema and text to the new `Table`; `statement_free` then frees
   nothing twice, and frees everything if the table was never created.
@@ -1106,6 +1244,8 @@ flowchart LR
         b[meta_command.c]
         k[tokenizer.c]
         l[parser.c]
+        q[expression.c]
+        r[planner.c]
         c[statement.c]
         d[executor.c]
         e[schema.c]
@@ -1166,7 +1306,7 @@ the `users` table, created by a separate run of the binary so its output never
 mixes with the test's — except the `CREATE TABLE` cases that need an empty
 database.
 
-The 26 cases:
+The 30 cases:
 
 | Area | Cases |
 | --- | --- |
@@ -1187,6 +1327,10 @@ The 26 cases:
 | Refused definitions | every `CREATE TABLE` check, including the row-size boundary (`TEXT(1352)` accepted with exactly 3 rows to a leaf, `TEXT(1353)` refused), malformed column definitions, and `.btree` / `.schema` / `.constants` with a missing, unknown or extra table name |
 | Many tables | three tables of different widths filled with interleaved inserts on the 3-key build, each a valid tree three or four levels deep holding exactly its rows after a reopen; then thirty more, splitting the catalog's root into an internal node, all found again in creation order |
 | Damaged catalog | a stored definition that doesn't parse, one that parses but is invalid, a catalog name that doesn't match its definition, and a root page past the end — each refused, untouched |
+| Column lists | chosen columns in any order and with repeats, on a table keyed by its second column; names ignoring case; unknown columns |
+| `WHERE` results | 24 conditions on a 60-row table with negative values, each compared with the same condition evaluated independently by `awk`: every operator on INT and TEXT, precedence, parentheses, column against column, constant conditions, a literal wider than its column, case-sensitive text, and key ranges alongside other conditions |
+| `WHERE` errors | every name, type and syntax error, `EXPLAIN` before anything but `SELECT`, and the nesting limit — 64 levels of `NOT` or parentheses accepted, the 65th refused at its column |
+| Plans and ranges | `EXPLAIN` for 21 conditions (merged, clamped, reversed, contradictory, and the ones that must scan); rows read for lookups, misses, ranges and scans on 1,000 rows; and 91 ranges over a four-level tree of scrambled even ids, many starting or ending exactly on its separators, each returning and reading exactly the ids inside it |
 
 How the suite earns its trust:
 
@@ -1242,7 +1386,13 @@ How the suite earns its trust:
   hits every kind of error — including the partly built syntax trees freed on the
   way out. A second run mixed in `CREATE TABLE` fragments: the 74 tables it managed
   to create, some with mangled names, all loaded back from their stored definitions
-  when the file was reopened.
+  when the file was reopened. A third mixed in `WHERE` and `EXPLAIN` fragments and
+  expressions nested 50 to 200 deep: 911 were refused at the nesting limit, and
+  nothing reached a sanitizer.
+- **Query mutation checks.** Letting `OR` bind tighter than `AND`, planning `<` as
+  `<=`, a range that ignores its high end, skipping the per-row `WHERE` inside a
+  range, comparing text without regard to case, and removing the nesting limit
+  each fail a test.
 - **Timeouts.** Scans follow on-disk pointers, so each test has a 10-second limit
   that turns a pointer cycle into a fast failure instead of a hang.
 
@@ -1328,6 +1478,17 @@ and is guaranteed to parse back to the same table.
 by, so requiring it keeps one key model through the engine: every table gets
 lookups and range scans by key, and duplicates are caught by the tree itself.
 
+**Plan from the key, check everything.** The planner only ever narrows which rows
+are read; the whole `WHERE` is evaluated on every one of them. Correctness never
+depends on the planner understanding a condition — a condition it can't use just
+means more rows are read — so the planner can stay small and still be safe.
+
+**Flat chains, bounded nesting.** `AND` and `OR` hold a list of operands, so a
+condition with a thousand terms is one level deep, and only `NOT` and parentheses
+add depth — at most 64 levels. Parsing, binding, evaluating and freeing an
+expression are recursive, and this bound is what makes that safe against any
+input.
+
 **Validate before allocate.** The binder proves the whole statement is valid before
 calling `record_init`. Early returns can't leak, and there's no half-built record to
 unwind.
@@ -1387,9 +1548,9 @@ flowchart LR
     classDef now fill:#fff2cc,stroke:#bba12a;
     classDef todo fill:#eeeeee,stroke:#999999;
 
-    class A,S1,S2,S3 done;
-    class S4 now;
-    class S5,S6 todo;
+    class A,S1,S2,S3,S4 done;
+    class S5 now;
+    class S6 todo;
 ```
 
 - **Done — the tutorial (1–14):** REPL, schema-driven rows, a file-backed pager, the
@@ -1408,11 +1569,14 @@ flowchart LR
   text, re-parsed and re-checked on open (file format 2). Any number of tables
   share one file, each with its INT primary key in any position; the hardcoded
   `users` table is gone.
-- **Next — Stage 4, `SELECT` column lists, typed `WHERE`, range scans:**
-  conditions on a table's primary key become a point lookup or a seek plus a
-  bounded walk along the leaf chain, and `EXPLAIN` shows which plan was chosen.
-- **Stage 5 — `DELETE`:** borrowing from and merging with siblings, collapsing the
-  root, and reusing freed pages, so the tree stays balanced.
+- **Done — Stage 4, `SELECT` column lists, typed `WHERE`, range scans:** conditions
+  on a table's primary key become a point lookup or a descent plus a bounded walk
+  along the leaf chain, the whole `WHERE` is checked on every row read, `EXPLAIN`
+  shows the plan and `.stats` the rows it read.
+- **Next — Stage 5, `DELETE`:** `DELETE FROM t [WHERE …]` bound and planned by the
+  same code, then borrowing from and merging with siblings, collapsing the root,
+  and reusing freed pages, so the tree stays balanced — and the separator invariant
+  that range scans rely on keeps holding.
 - **Stage 6 — error audit and presentation:** every storage failure reports an error
   instead of ending the process, plus a benchmark of lookups against scans.
 - **Later, perhaps:** dropping on-disk parent pointers for a path kept by the cursor,
@@ -1440,6 +1604,8 @@ mini-sql/
 │   ├── catalog.h           # CATALOG_SQL, CatalogEntry, adding and loading entries
 │   ├── database.h          # Database + db_open / db_close, finding and creating tables
 │   ├── cursor.h            # Cursor + start/find/value/advance
+│   ├── expression.h        # BoundExpr: binding and evaluating a WHERE
+│   ├── planner.h           # Plan: POINT / RANGE / EMPTY / SCAN, and its EXPLAIN text
 │   ├── statement.h         # Statement, PrepareResult, the binder's entry point
 │   └── executor.h          # ExecuteResult, execute_statement
 ├── src/
@@ -1457,6 +1623,8 @@ mini-sql/
 │   ├── catalog.c
 │   ├── database.c
 │   ├── cursor.c
+│   ├── expression.c
+│   ├── planner.c
 │   ├── statement.c
 │   ├── executor.c
 │   └── main.c              # REPL — the only file with no header
@@ -1479,11 +1647,14 @@ This is a learning engine. Known gaps, most of them on the [roadmap](#roadmap):
   hit a fatal error, and unsaved changes are lost. No rollback journal or WAL.
 - **Older files** — files from before the header existed, and format-1 files from
   before the catalog, are refused with a message; delete and recreate them.
-- **A small SQL dialect** — `CREATE TABLE`, `INSERT` and `SELECT *`, one statement
-  per line, INT and TEXT(n) columns only, no NULLs or defaults. `WHERE` and
-  `DELETE` are on the roadmap; `UPDATE`, `DROP TABLE`, `ALTER TABLE`, joins and
-  subqueries are not. The keywords are reserved, so a table or column can't be named
-  `key` or `text`.
+- **A small SQL dialect** — `CREATE TABLE`, `INSERT`, and `SELECT` with a column
+  list and a `WHERE` of comparisons, one statement per line; INT and TEXT(n)
+  columns only, no NULLs or defaults. `DELETE` is on the roadmap; `UPDATE`,
+  `DROP TABLE`, `ALTER TABLE`, `ORDER BY`, `LIMIT`, aggregates, `LIKE`, arithmetic,
+  joins and subqueries are not. The keywords are reserved, so a table or column
+  can't be named `key` or `text`.
+- **One index per table** — only the primary key; a `WHERE` on any other column
+  reads every row.
 - **Table limits** — a table needs exactly one INT primary key; its name can be up
   to 64 bytes, a row up to 1,356 bytes, and its canonical definition up to 1,024.
   The catalog is visible only through `.tables` and `.schema`, not to `SELECT`.
