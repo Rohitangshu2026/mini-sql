@@ -94,6 +94,12 @@ typedef struct{
     ExprAst* where;         /* heap-owned; NULL without a WHERE clause */
 }SelectAst;
 
+/* DELETE FROM table [WHERE expression] */
+typedef struct{
+    char* table_name;       /* heap-owned */
+    ExprAst* where;         /* heap-owned; NULL without a WHERE clause */
+}DeleteAst;
+
 /* A column's declared type, as written: INT, or TEXT with a width. */
 typedef enum{
     AST_TYPE_INT,
@@ -125,12 +131,13 @@ typedef enum{
     AST_EMPTY,
     AST_INSERT,
     AST_SELECT,
-    AST_CREATE_TABLE
+    AST_CREATE_TABLE,
+    AST_DELETE
 }AstKind;
 
 /*
  * A parsed statement: its kind, the node for that kind, and whether it was
- * prefixed with EXPLAIN (only a SELECT can be).
+ * prefixed with EXPLAIN (only a SELECT or a DELETE can be).
  */
 typedef struct{
     AstKind kind;
@@ -139,6 +146,7 @@ typedef struct{
         InsertAst insert;
         SelectAst select;
         CreateTableAst create_table;
+        DeleteAst delete_rows;
     };
 }Ast;
 

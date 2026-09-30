@@ -4,6 +4,7 @@
 
 #include<stdio.h>
 #include<stdlib.h>
+#include<string.h>
 #include<unistd.h>
 #include<fcntl.h>
 #include<sys/stat.h>
@@ -67,6 +68,7 @@ Pager* pager_open(const char* filename){
 
     pager->capacity = 0;
     pager->pages = NULL;
+    pager->free_head = 0;
     grow_page_cache(pager, pager->num_pages > INITIAL_PAGE_CAPACITY ? pager->num_pages : INITIAL_PAGE_CAPACITY);
 
     return pager;
@@ -118,14 +120,45 @@ void* pager_get_page(Pager* pager, uint32_t page_num){
     return pager->pages[page_num];
 }
 
+/* Where a free page keeps the number of the next page on the free list. */
+#define FREE_PAGE_NEXT_OFFSET 4u
+
 /*
- * Until deleted pages are recycled through a free list, every new node simply
- * goes at the end of the file, so the next unused page is num_pages. The page
- * isn't claimed until pager_get_page grows num_pages past it — hence the
- * fetch-before-allocating-again contract documented in the header.
+ * Takes the first page off the free list if there is one, after checking it
+ * really is marked free — a list pointing at a live node would hand that node
+ * out a second time, so it's treated as corruption. Otherwise the page is the
+ * next one past the end of the file, which fetching adds to the database. The
+ * page is zero-filled either way: a reused page is cleared here, a new one is
+ * allocated zeroed.
  */
-uint32_t get_unused_page_num(Pager* pager){
-    return pager->num_pages;
+uint32_t pager_allocate_page(Pager* pager){
+    if(pager->free_head != 0){
+        uint32_t page_num = pager->free_head;
+        uint8_t* page = pager_get_page(pager, page_num);
+        if(page[0] != FREE_PAGE_MARKER){
+            printf("Corrupt free list: page %u is not a free page\n", page_num);
+            exit(EXIT_FAILURE);
+        }
+        memcpy(&pager->free_head, page + FREE_PAGE_NEXT_OFFSET, sizeof(uint32_t));
+        memset(page, 0, PAGE_SIZE);
+        return page_num;
+    }
+
+    uint32_t page_num = pager->num_pages;
+    pager_get_page(pager, page_num);
+    return page_num;
+}
+
+/*
+ * Pushes a page onto the front of the free list: cleared, marked with
+ * FREE_PAGE_MARKER, and pointing at the old head.
+ */
+void pager_free_page(Pager* pager, uint32_t page_num){
+    uint8_t* page = pager_get_page(pager, page_num);
+    memset(page, 0, PAGE_SIZE);
+    page[0] = FREE_PAGE_MARKER;
+    memcpy(page + FREE_PAGE_NEXT_OFFSET, &pager->free_head, sizeof(uint32_t));
+    pager->free_head = page_num;
 }
 
 /*

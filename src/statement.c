@@ -209,6 +209,32 @@ static PrepareResult bind_select(Database* db, const SelectAst* select, bool exp
 }
 
 /*
+ * Binds a DELETE exactly as a SELECT is bound, minus the column list: the
+ * table, then the WHERE, then the plan. The rows it removes are therefore the
+ * rows a SELECT with the same WHERE would print.
+ */
+static PrepareResult bind_delete(Database* db, const DeleteAst* delete_rows, bool explain, Statement* statement,
+                                 SqlError* error){
+    Table* table = bind_table(db, delete_rows->table_name, error);
+    if(table == NULL)
+        return PREPARE_ERROR;
+
+    BoundExpr* where = NULL;
+    if(delete_rows->where != NULL){
+        where = expression_bind(delete_rows->where, table->schema, error);
+        if(where == NULL)
+            return PREPARE_ERROR;
+    }
+
+    statement->type = STATEMENT_DELETE;
+    statement->table = table;
+    statement->where = where;
+    statement->plan = plan_select(where, table->key_column_id);
+    statement->explain = explain;
+    return PREPARE_SUCCESS;
+}
+
+/*
  * Binds a CREATE TABLE. The one check that needs the database — that the name
  * is free, ignoring case — comes first; everything else is the table
  * definition's, shared with reloading tables from the catalog.
@@ -248,6 +274,9 @@ PrepareResult prepare_statement(Database* db, const char* sql, Statement* statem
             break;
         case AST_CREATE_TABLE:
             result = bind_create_table(db, &ast.create_table, statement, error);
+            break;
+        case AST_DELETE:
+            result = bind_delete(db, &ast.delete_rows, ast.explain, statement, error);
             break;
     }
 

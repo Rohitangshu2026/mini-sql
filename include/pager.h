@@ -11,6 +11,13 @@
 extern const uint32_t PAGE_SIZE;
 
 /*
+ * The first byte of a page on the free list. Node pages start with their type,
+ * 0 (internal) or 1 (leaf), so a free page can never be mistaken for a node: a
+ * stray pointer into one reads as a corrupt node and is refused.
+ */
+#define FREE_PAGE_MARKER 0xFFu
+
+/*
  * Owns the database file and an in-memory cache of its pages. A page is loaded
  * lazily on first access and only written back on close. `num_pages` is the
  * number of whole pages the database currently spans (grown as new pages are
@@ -28,6 +35,7 @@ typedef struct{
     uint32_t num_pages;     /* pages the database spans */
     uint32_t capacity;      /* slots in `pages`; never less than num_pages */
     void** pages;           /* page cache; NULL == not resident */
+    uint32_t free_head;     /* first page of the free list; 0 when it's empty */
 }Pager;
 
 /*
@@ -47,13 +55,19 @@ Pager* pager_open(const char* filename);
 void* pager_get_page(Pager* pager, uint32_t page_num);
 
 /*
- * Returns the page number a newly created node should occupy: the first page
- * past the current end of the database. Nothing is reserved — num_pages only
- * advances once that page is fetched with pager_get_page — so a caller must
- * fetch the page it was given before asking for another, or it will be handed
- * the same number twice.
+ * Allocates a page for a new node and returns its number. The page comes off
+ * the free list when there is one, and is otherwise appended past the end of
+ * the file; either way it's resident and zero-filled by the time this returns,
+ * so the caller can build on it straight away.
  */
-uint32_t get_unused_page_num(Pager* pager);
+uint32_t pager_allocate_page(Pager* pager);
+
+/*
+ * Puts a page no node uses any more onto the free list, for a later allocation
+ * to reuse. The page is zeroed — nothing it held lingers in the file — then
+ * marked free and linked to the previous head of the list.
+ */
+void pager_free_page(Pager* pager, uint32_t page_num);
 
 /* Writes one whole page back to its offset in the file. Exits on I/O error. */
 void pager_flush(Pager* pager, uint32_t page_num);

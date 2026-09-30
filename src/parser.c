@@ -8,13 +8,15 @@
 /*
  * Grammar, one function per rule:
  *
- *   statement  := [ EXPLAIN ] ( insert | select | create ) [ ';' ] END
- *                 (EXPLAIN only before a select; a blank line is also allowed)
+ *   statement  := [ EXPLAIN ] ( insert | select | create | delete ) [ ';' ] END
+ *                 (EXPLAIN only before a select or a delete; a blank line is
+ *                 also allowed)
  *   insert     := INSERT INTO name [ '(' name { ',' name } ')' ]
  *                 VALUES '(' literal { ',' literal } ')'
  *   select     := SELECT ( '*' | name { ',' name } ) FROM name [ WHERE expr ]
  *   create     := CREATE TABLE name '(' column_def { ',' column_def } ')'
  *   column_def := name ( INT | TEXT '(' INTEGER ')' ) [ PRIMARY KEY ]
+ *   delete     := DELETE FROM name [ WHERE expr ]
  *   expr       := and_expr { OR and_expr }
  *   and_expr   := not_expr { AND not_expr }
  *   not_expr   := NOT not_expr | primary
@@ -481,6 +483,27 @@ static bool parse_select(Parser* parser, SelectAst* select){
 }
 
 /*
+ * delete := DELETE FROM name [ WHERE expr ]
+ *
+ * The WHERE is the same expression a SELECT takes, so a DELETE chooses its
+ * rows exactly the way a SELECT with the same condition would find them.
+ */
+static bool parse_delete(Parser* parser, DeleteAst* delete_rows){
+    advance(parser);   /* DELETE */
+    if(!expect(parser, TOKEN_FROM, NULL))
+        return false;
+    if(!parse_name(parser, &delete_rows->table_name, "a table name"))
+        return false;
+
+    if(match(parser, TOKEN_WHERE)){
+        delete_rows->where = parse_or(parser, 0);
+        if(delete_rows->where == NULL)
+            return false;
+    }
+    return true;
+}
+
+/*
  * column_def := name ( INT | TEXT '(' INTEGER ')' ) [ PRIMARY KEY ]
  *
  * Only the shape is checked here. Whether the width is sensible, or the table
@@ -556,9 +579,9 @@ static bool parse_create(Parser* parser, CreateTableAst* create){
 }
 
 /*
- * statement := [ EXPLAIN ] ( insert | select | create ) [ ';' ] END
+ * statement := [ EXPLAIN ] ( insert | select | create | delete ) [ ';' ] END
  *
- * An optional EXPLAIN comes first, and only a SELECT may follow it. Then it
+ * An optional EXPLAIN comes first, and only a SELECT or a DELETE may follow it. Then it
  * dispatches on the first token and requires the line to end, allowing one
  * optional ';' first. Anything after the statement — a second statement, or a
  * clause that isn't supported — is a syntax error rather than being silently
@@ -577,8 +600,8 @@ bool parse_statement(const char* sql, Ast* ast, SqlError* error){
 
     if(match(&parser, TOKEN_EXPLAIN)){
         ast->explain = true;
-        if(!check(&parser, TOKEN_SELECT))
-            fail_expected(&parser, "SELECT");
+        if(!check(&parser, TOKEN_SELECT) && !check(&parser, TOKEN_DELETE))
+            fail_expected(&parser, "SELECT or DELETE");
     }
 
     if(!parser.failed){
@@ -594,8 +617,12 @@ bool parse_statement(const char* sql, Ast* ast, SqlError* error){
             ast->kind = AST_CREATE_TABLE;
             parse_create(&parser, &ast->create_table);
         }
+        else if(check(&parser, TOKEN_DELETE)){
+            ast->kind = AST_DELETE;
+            parse_delete(&parser, &ast->delete_rows);
+        }
         else if(!check(&parser, TOKEN_SEMICOLON) && !check(&parser, TOKEN_END))
-            fail_expected(&parser, "INSERT, SELECT or CREATE");
+            fail_expected(&parser, "INSERT, SELECT, CREATE or DELETE");
     }
 
     if(!parser.failed){
@@ -639,6 +666,10 @@ void ast_free(Ast* ast){
             for(uint32_t i = 0; i < ast->create_table.num_columns; ++i)
                 free(ast->create_table.columns[i].name);
             free(ast->create_table.columns);
+            break;
+        case AST_DELETE:
+            free(ast->delete_rows.table_name);
+            free_expr(ast->delete_rows.where);
             break;
         case AST_EMPTY:
             break;

@@ -59,6 +59,23 @@ bool table_insert(Table* table, const Record* record){
     return true;
 }
 
+/*
+ * Deletes a row by key. table_find lands on the key's cell if it exists; the
+ * bounds check comes first because the cursor may sit one past the last cell,
+ * where there is no key to compare.
+ */
+bool table_delete(Table* table, uint32_t key){
+    Cursor* cursor = table_find(table, key);
+    void* leaf = pager_get_page(table->pager, cursor->page_num);
+    bool found = cursor->cell_num < *leaf_node_num_cells(leaf) &&
+                 *leaf_node_key(leaf, cursor->cell_num, table->schema) == key;
+
+    if(found)
+        leaf_node_delete(table->pager, cursor->page_num, cursor->cell_num, table->schema);
+    free(cursor);
+    return found;
+}
+
 /* Frees the table's name, schema and text, then the table itself. */
 void table_free(Table* table){
     if(table == NULL)

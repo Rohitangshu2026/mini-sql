@@ -37,7 +37,7 @@ static void add_table(Database* db, Table* table){
 
 /* Makes a fresh page the empty root leaf of a new b-tree. */
 static uint32_t allocate_root_leaf(Pager* pager){
-    uint32_t page_num = get_unused_page_num(pager);
+    uint32_t page_num = pager_allocate_page(pager);
     void* node = pager_get_page(pager, page_num);
     initialize_leaf_node(node);
     set_node_root(node, true);
@@ -113,17 +113,21 @@ Database* db_open(const char* filename){
     if(!file_header_validate(header, db->pager->num_pages, filename, message, sizeof(message)))
         refuse("%s", message);
 
+    db->pager->free_head = file_header_free_head(header);
     db->catalog = catalog_open(db->pager, file_header_catalog_root_page(header));
     load_tables(db);
     return db;
 }
 
 /*
- * Flushes every resident page, then releases everything. Pages are written
- * whether or not they changed; this is the only point data reaches disk.
+ * Flushes every resident page, then releases everything. The free list's head
+ * lives in the pager while the database is open, so it's written back into the
+ * header first. Pages are written whether or not they changed; this is the
+ * only point data reaches disk.
  */
 void db_close(Database* db){
     Pager* pager = db->pager;
+    file_header_set_free_head(pager_get_page(pager, 0), pager->free_head);
     for(uint32_t i = 0; i < pager->num_pages; ++i){
         if(pager->pages[i] == NULL)
             continue;
@@ -152,7 +156,7 @@ Table* database_find_table(Database* db, const char* name){
 
 /*
  * Gives the new table a root leaf, records it in the catalog, then adds it to
- * the open tables. The root page is fetched before the catalog insert, which
+ * the open tables. The root page is allocated before the catalog insert, which
  * may itself allocate pages if the catalog splits.
  */
 void database_create_table(Database* db, TableDefinition* definition){

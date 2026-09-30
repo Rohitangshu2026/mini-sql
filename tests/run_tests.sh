@@ -154,7 +154,10 @@ LEAF_MAX_CELLS=13
 #     key in the subtree on its left
 #   - a node's printed size disagrees with what's printed under it, or an
 #     internal node doesn't alternate child, key, child ... child
-#   - a node is empty or holds more than it may (MAX_CELLS / MAX_KEYS)
+#   - a node holds more than it may (MAX_CELLS / MAX_KEYS), or fewer than its
+#     minimum fill: ceil(MAX_CELLS/2) cells for a leaf and ceil(MAX_KEYS/2) - 1
+#     keys for an internal node, except at the root, whose leaf may even be
+#     empty and whose internal node needs one key
 #   - leaves sit at different depths
 # Lets a test cover a tree of any size and insertion order without spelling
 # the whole tree out.
@@ -199,7 +202,9 @@ btree_check() {
             size[top] = n + 0
             entries[top] = 0
             children[top] = 0
-            if (size[top] < 1) fail("empty node")
+            is_root = (top == 1)
+            if (kind[top] == "leaf" && !is_root && size[top] < int((max_cells + 1) / 2)) fail("leaf below minimum fill")
+            if (kind[top] == "internal" && size[top] < (is_root ? 1 : int((max_keys + 1) / 2) - 1)) fail("internal node below minimum fill")
             if (kind[top] == "leaf" && size[top] > max_cells) fail("leaf over capacity")
             if (kind[top] == "internal" && size[top] > max_keys) fail("internal node over capacity")
             if (kind[top] == "leaf") {
@@ -640,9 +645,9 @@ t_large_table() {
 }
 
 t_file_header() {
-    # Page 0 of a new database is its header: the magic string, then format 2,
-    # 4096-byte pages and the catalog's root on page 1 (the fields are read in
-    # the host's byte order, like the file writes them). The first table
+    # Page 0 of a new database is its header: the magic string, then format 3,
+    # 4096-byte pages, the catalog's root on page 1 and an empty free list (the
+    # fields are read in the host's byte order, like the file writes them). The first table
     # created gets page 2 for its root. The header doesn't change as the table
     # grows or across a reopen; the catalog stays a one-row leaf, while the
     # users root becomes internal after the first split.
@@ -650,13 +655,13 @@ t_file_header() {
     fresh_db
     { inserts $(seq 1 30); printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
     [[ "$(head -c 16 "$TESTDB" | tr '\0' '@')" == "mini-sql format@" ]] || return 1
-    [[ "$(od -An -tu4 -j16 -N12 "$TESTDB" | xargs)" == "2 4096 1" ]] || return 1
+    [[ "$(od -An -tu4 -j16 -N16 "$TESTDB" | xargs)" == "3 4096 1 0" ]] || return 1
     [[ "$(od -An -tu1 -j4096 -N2 "$TESTDB" | xargs)" == "1 1" ]] || return 1   # catalog: leaf, root
     [[ "$(od -An -tu1 -j8192 -N2 "$TESTDB" | xargs)" == "0 1" ]] || return 1   # users: internal, root
 
     # The rest of page 0 is reserved for fields later formats add, which will
     # read an old file's zeros as "not set", so it must be zero.
-    [[ "$(head -c 4096 "$TESTDB" | tail -c 4068 | tr -d '\0' | wc -c | xargs)" == 0 ]] || return 1
+    [[ "$(head -c 4096 "$TESTDB" | tail -c 4064 | tr -d '\0' | wc -c | xargs)" == 0 ]] || return 1
 
     head -c 4096 "$TESTDB" >"$copy"
     { inserts $(seq 31 60); printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
@@ -721,12 +726,16 @@ t_file_rejects_foreign() {
         { inserts 1; printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
     }
 
-    # A format-1 file (from before the catalog) and one from a future format.
+    # Files from earlier formats — 1 (before the catalog) and 2 (before the
+    # free list) — and one from a future format.
     make_good_file; patch_bytes 16 '\001\000\000\000'
-    expect_refusal "Error: $TESTDB uses file format 1; this build reads format 2." || return 1
+    expect_refusal "Error: $TESTDB uses file format 1; this build reads format 3." || return 1
 
-    make_good_file; patch_bytes 16 '\003\000\000\000'
-    expect_refusal "Error: $TESTDB uses file format 3; this build reads format 2." || return 1
+    make_good_file; patch_bytes 16 '\002\000\000\000'
+    expect_refusal "Error: $TESTDB uses file format 2; this build reads format 3." || return 1
+
+    make_good_file; patch_bytes 16 '\004\000\000\000'
+    expect_refusal "Error: $TESTDB uses file format 4; this build reads format 3." || return 1
 
     make_good_file; patch_bytes 20 '\000\040\000\000'
     expect_refusal "Error: $TESTDB uses 8192-byte pages; this build uses 4096." || return 1
@@ -736,6 +745,9 @@ t_file_rejects_foreign() {
 
     make_good_file; patch_bytes 24 '\143\000\000\000'
     expect_refusal "Error: $TESTDB is corrupt: its catalog root page 99 is not a node page of the file." || return 1
+
+    make_good_file; patch_bytes 28 '\143\000\000\000'
+    expect_refusal "Error: $TESTDB is corrupt: its free-list head 99 is not a page of the file." || return 1
 
     # A length that isn't a whole number of pages is caught before the header
     # is even read.
@@ -764,11 +776,11 @@ t_sql_syntax_errors() {
         "SELECT * FROM users @" \
         "Syntax error: unrecognized character '@' at column 21." \
         "UPDATE users SET id = 1" \
-        "Syntax error: expected INSERT, SELECT or CREATE near 'UPDATE' at column 1." \
+        "Syntax error: expected INSERT, SELECT, CREATE or DELETE near 'UPDATE' at column 1." \
         "insert abc bob bob@x.com" \
         "Syntax error: expected INTO near 'abc' at column 8." \
         "insertfoo 3 dave d@x.com" \
-        "Syntax error: expected INSERT, SELECT or CREATE near 'insertfoo' at column 1." \
+        "Syntax error: expected INSERT, SELECT, CREATE or DELETE near 'insertfoo' at column 1." \
         "SELECT * FROM users junk" \
         "Syntax error: expected end of statement near 'junk' at column 21." \
         "select * from nowhere where junk" \
@@ -1219,9 +1231,9 @@ t_where_errors() {
         "SELECT * FROM users WHERE id = 1 AND" \
         "Syntax error: expected a column or a value at end of statement." \
         "EXPLAIN INSERT INTO users VALUES (1, 'a', 'b')" \
-        "Syntax error: expected SELECT near 'INSERT' at column 9." \
+        "Syntax error: expected SELECT or DELETE near 'INSERT' at column 9." \
         "EXPLAIN" \
-        "Syntax error: expected SELECT at end of statement." \
+        "Syntax error: expected SELECT or DELETE at end of statement." \
         "SELECT * FROM users WHERE ${nots}id = 1" \
         "Syntax error: expression nested too deeply at column 283." \
         "SELECT * FROM users WHERE ${parens}id = 1" \
@@ -1316,6 +1328,177 @@ t_explain_and_ranges() {
     done
 }
 
+# ids_present -> the ids 1..MAX_ID marked in the `present` array, in order
+ids_present() {
+    local id
+    for (( id = 1; id <= $1; id++ )); do
+        (( ${present[id]:-0} )) && echo "$id"
+    done
+}
+
+t_delete_basic() {
+    # DELETE removes exactly the rows a SELECT with the same WHERE returns: by
+    # key (reading one row), a key that isn't there (reading none, changing
+    # nothing), a key range (reading only the range), and a condition on other
+    # columns (reading every row). EXPLAIN DELETE shows the plan and deletes
+    # nothing. The deletions persist, DELETE with no WHERE empties the table
+    # down to one empty root leaf, and a bad DELETE is refused before it
+    # touches anything.
+    local out
+    run "$(inserts $(seq 1 100))"$'\n.exit\n' >/dev/null
+    out=$(query "DELETE FROM users WHERE id = 50;")
+    [[ "$(rows_examined "$out")" == 1 && -z "$(error_lines "$out")" ]] || return 1
+    out=$(query "DELETE FROM users WHERE id = 500;")
+    [[ "$(rows_examined "$out")" == 0 && -z "$(error_lines "$out")" ]] || return 1
+    out=$(query "DELETE FROM users WHERE id > 90;")
+    [[ "$(rows_examined "$out")" == 10 ]] || return 1
+    out=$(query "DELETE FROM users WHERE username = 'user7' OR email = 'person8@example.com';")
+    [[ "$(rows_examined "$out")" == 89 ]] || return 1
+    out=$(query "EXPLAIN DELETE FROM users WHERE id >= 20 AND id < 30;")
+    [[ "$(plan_line "$out")" == "SEARCH users USING PRIMARY KEY (id >= 20 AND id <= 29)" ]] || return 1
+    out=$(query "EXPLAIN DELETE FROM users;")
+    [[ "$(plan_line "$out")" == "SCAN users" && "$(rows_examined "$out")" == 0 ]] || return 1
+
+    local expected
+    expected=$(expected_rows $(seq 1 6) $(seq 9 49) $(seq 51 90))
+    out=$(printf '.btree users\nSELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    btree_check "$out" 510 >/dev/null && [[ "$(select_rows "$out")" == "$expected" ]] || return 1
+
+    out=$(query "DELETE FROM users;")
+    [[ "$(rows_examined "$out")" == 87 ]] || return 1
+    out=$(printf '.btree users\nSELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    [[ "$(btree_block "$out")" == "- leaf (size 0)" && -z "$(select_rows "$out")" ]] || return 1
+
+    check_error_cases \
+        "DELETE users" \
+        "Syntax error: expected FROM near 'users' at column 8." \
+        "DELETE FROM nope" \
+        "Error: no such table: nope." \
+        "DELETE FROM users WHERE id = 'x'" \
+        "Type error: cannot compare INT column 'id' with 'x'." \
+        "DELETE FROM users WHERE" \
+        "Syntax error: expected a column or a value at end of statement."
+}
+
+t_delete_rebalance() {
+    # Deleting every row of a deep tree, in three orders, keeps it a valid
+    # B+ tree the whole way down: after every 30 deletes it must pass
+    # btree_check — balanced, every node but the root at least half full,
+    # every separator the largest key on its left — and hold exactly the rows
+    # that remain. Ascending deletes keep emptying the leftmost leaves and
+    # borrowing from the right; descending deletes remove each leaf's largest
+    # key, so separators must keep following it down; the scrambled order
+    # mixes both. Midway, range queries must return, and read, exactly the
+    # remaining keys in range, which relies on the separators being exact.
+    # At the end one empty root leaf is left.
+    local DB="$SMALL_FANOUT_DB" order out id n batch low high expected present
+    require_small_fanout || return 1
+    local ids
+    ids=$(scrambled 307)
+    for order in ascending descending scrambled; do
+        run "$(inserts $ids)"$'\n.exit\n' >/dev/null
+        present=()
+        for id in $ids; do present[id]=1; done
+        case $order in
+            ascending)  order=$(seq 1 306) ;;
+            descending) order=$(seq 306 -1 1) ;;
+            scrambled)  order=$(for (( id = 1; id < 307; id++ )); do echo $(( id * 97 % 307 )); done) ;;
+        esac
+        n=0
+        batch=""
+        for id in $order; do
+            batch+="DELETE FROM users WHERE id = $id;"$'\n'
+            unset "present[$id]"
+            n=$(( n + 1 ))
+            (( n % 30 == 0 || n == 306 )) || continue
+            out=$(printf '%s.btree users\nSELECT * FROM users;\n.exit\n' "$batch" | "$DB" "$TESTDB" | normalize)
+            batch=""
+            [[ -z "$(error_lines "$out")" ]] || return 1
+            if (( n < 306 )); then
+                btree_check "$out" 3 >/dev/null || { echo "delete_rebalance: $order after $n" >&2; return 1; }
+            else
+                [[ "$(btree_block "$out")" == "- leaf (size 0)" ]] || return 1
+            fi
+            expected=$(ids_present 306)
+            [[ "$(select_rows "$out")" == "$( [[ -n "$expected" ]] && expected_rows $expected)" ]] || return 1
+
+            if (( n == 150 )); then
+                for low in 1 40 101 150 222 290; do
+                    high=$(( low + 25 ))
+                    expected=$(ids_present 306 | awk -v l="$low" -v h="$high" '$1 >= l && $1 <= h')
+                    out=$(query "SELECT * FROM users WHERE id >= $low AND id <= $high;")
+                    [[ "$(select_rows "$out")" == "$( [[ -n "$expected" ]] && expected_rows $expected)" ]] || return 1
+                    [[ "$(rows_examined "$out")" == "$(grep -c . <<<"$expected")" ]] || return 1
+                done
+            fi
+        done
+    done
+}
+
+t_delete_random() {
+    # Model-based: 1,500 inserts and deletes of keys 1-250, chosen by a fixed
+    # linear congruential generator so every run is the same, against a bash
+    # array of the keys that should exist. Every 150 operations the tree must
+    # pass btree_check and hold exactly the model's rows, and inserting a key
+    # the model already has must have been refused as a duplicate. The final
+    # state must survive a reopen.
+    local DB="$SMALL_FANOUT_DB" state=20260930 op key batch duplicates expected out present=()
+    require_small_fanout || return 1
+    fresh_db
+    batch=""
+    duplicates=0
+    for (( op = 1; op <= 1500; op++ )); do
+        state=$(( (state * 1103515245 + 12345) % 2147483648 ))
+        key=$(( (state >> 8) % 250 + 1 ))
+        if (( (state >> 20) % 2 == 0 )); then
+            batch+="INSERT INTO users VALUES ($key, 'user$key', 'person$key@example.com');"$'\n'
+            if (( ${present[key]:-0} )); then
+                duplicates=$(( duplicates + 1 ))
+            fi
+            present[key]=1
+        else
+            batch+="DELETE FROM users WHERE id = $key;"$'\n'
+            unset "present[$key]"
+        fi
+        (( op % 150 == 0 )) || continue
+        out=$(printf '%s.btree users\nSELECT * FROM users;\n.exit\n' "$batch" | "$DB" "$TESTDB" | normalize)
+        batch=""
+        [[ $(grep -c 'Error: Duplicate key\.' <<<"$out") -eq $duplicates ]] || return 1
+        duplicates=0
+        expected=$(ids_present 250)
+        if [[ -n "$expected" ]]; then
+            btree_check "$out" 3 >/dev/null || { echo "delete_random: after $op" >&2; return 1; }
+            [[ "$(select_rows "$out")" == "$(expected_rows $expected)" ]] || return 1
+        fi
+    done
+    out=$(printf '.btree users\nSELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    btree_check "$out" 3 >/dev/null && [[ "$(select_rows "$out")" == "$(expected_rows $(ids_present 250))" ]]
+}
+
+t_delete_pages() {
+    # Pages emptied by merges go on the free list, and new nodes reuse them
+    # before the file grows. 300 ascending rows fill the file; deleting them
+    # all, in a later session, leaves the file the same size with a free list
+    # in the header whose first page is marked free (0xFF). Reinserting the
+    # same rows in a third session reuses those pages: the file doesn't grow,
+    # and the tree and rows are whole.
+    local pages_before out head
+    run "$(inserts $(seq 1 300))"$'\n.exit\n' >/dev/null
+    pages_before=$(( $(wc -c <"$TESTDB") / 4096 ))
+    [[ "$(od -An -tu4 -j28 -N4 "$TESTDB" | xargs)" == 0 ]] || return 1
+
+    printf 'DELETE FROM users;\n.exit\n' | "$DB" "$TESTDB" >/dev/null
+    [[ $(( $(wc -c <"$TESTDB") / 4096 )) -eq $pages_before ]] || return 1
+    head=$(od -An -tu4 -j28 -N4 "$TESTDB" | xargs)
+    (( head > 0 )) || return 1
+    [[ "$(od -An -tu1 -j $(( head * 4096 )) -N1 "$TESTDB" | xargs)" == 255 ]] || return 1
+
+    { inserts $(seq 1 300); printf '.exit\n'; } | "$DB" "$TESTDB" >/dev/null
+    [[ $(( $(wc -c <"$TESTDB") / 4096 )) -eq $pages_before ]] || return 1
+    out=$(printf '.btree users\nSELECT * FROM users;\n.exit\n' | "$DB" "$TESTDB" | normalize)
+    btree_check "$out" 510 >/dev/null && [[ "$(select_rows "$out")" == "$(expected_rows $(seq 1 300))" ]]
+}
+
 t_duplicate_key() {
     # The second insert of id 1 must be rejected, leaving exactly one row.
     local out
@@ -1324,7 +1507,7 @@ t_duplicate_key() {
     [[ $(grep -cF '(1, user1, person1@example.com)' <<<"$out") -eq 1 ]]
 }
 
-ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split select_multilevel select_empty btree_nonroot_split btree_internal_split btree_internal_split_persists large_table file_header file_rejects_foreign sql_syntax_errors sql_binding_errors sql_lexical create_table create_table_errors many_tables catalog_corrupt select_columns where_filters where_errors explain_and_ranges)
+ALL=(inserts_and_retrieves max_length_strings string_too_long negative_id persistence constants btree_one_node duplicate_key btree_split btree_split_persists btree_insert_after_split select_multilevel select_empty btree_nonroot_split btree_internal_split btree_internal_split_persists large_table file_header file_rejects_foreign sql_syntax_errors sql_binding_errors sql_lexical create_table create_table_errors many_tables catalog_corrupt select_columns where_filters where_errors explain_and_ranges delete_basic delete_rebalance delete_random delete_pages)
 
 run_one() {
     if "t_$1"; then

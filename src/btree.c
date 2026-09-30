@@ -395,7 +395,7 @@ static void create_new_root(Pager* pager, uint32_t root_page_num, uint32_t right
                             const Schema* schema){
     void* root = pager_get_page(pager, root_page_num);
     void* right_child = pager_get_page(pager, right_child_page_num);
-    uint32_t left_child_page_num = get_unused_page_num(pager);
+    uint32_t left_child_page_num = pager_allocate_page(pager);
     void* left_child = pager_get_page(pager, left_child_page_num);
 
     memcpy(left_child, root, PAGE_SIZE);
@@ -548,7 +548,7 @@ static void internal_node_split_and_insert(Pager* pager, uint32_t page_num, uint
     void* child = pager_get_page(pager, child_page_num);
     uint32_t child_max = get_node_max_key(pager, child, schema);
 
-    uint32_t new_page_num = get_unused_page_num(pager);
+    uint32_t new_page_num = pager_allocate_page(pager);
     void* new_node = pager_get_page(pager, new_page_num);
     initialize_internal_node(new_node);
     *node_parent(new_node) = *node_parent(old_node);
@@ -614,7 +614,7 @@ static void leaf_node_split_and_insert(Pager* pager, uint32_t page_num, uint32_t
                                        uint32_t key, const Record* value, const Schema* schema){
     void* old_node = pager_get_page(pager, page_num);
     uint32_t old_max = get_node_max_key(pager, old_node, schema);
-    uint32_t new_page_num = get_unused_page_num(pager);
+    uint32_t new_page_num = pager_allocate_page(pager);
     void* new_node = pager_get_page(pager, new_page_num);
     initialize_leaf_node(new_node);
     *node_parent(new_node) = *node_parent(old_node);
@@ -697,6 +697,368 @@ void leaf_node_insert(Pager* pager, uint32_t page_num, uint32_t cell_num, uint32
     *(leaf_node_num_cells(node)) += 1;
     *(leaf_node_key(node, cell_num, schema)) = key;
     serialize_record(value, leaf_node_value(node, cell_num, schema));
+}
+
+/*
+ * Deletion.
+ *
+ * Every node but the root keeps a minimum fill, so the tree stays balanced
+ * and its height stays logarithmic however rows come and go:
+ *
+ *   leaves          at least ceil(M/2) cells, M being the leaf capacity
+ *   internal nodes  at least ceil(K/2) - 1 keys, K being the key cap
+ *
+ * These are exactly the sizes a split leaves, so a tree built only by inserts
+ * already meets them. Deleting can take a node one below its minimum, and it's
+ * then repaired from a sibling under the same parent: by borrowing one entry
+ * when the sibling can spare it, and otherwise by merging the two — which a
+ * node one short plus a sibling at the minimum always fits. A merge takes a
+ * separator and a child out of the parent, which can leave the parent short in
+ * turn, so repairs can climb to the root; a root left with a single child
+ * gives way to that child.
+ *
+ * Throughout, every separator stays equal to the largest key in the subtree to
+ * its left. Range scans and lookups start from one descent that relies on it,
+ * so each step below that changes what a subtree holds also fixes the one
+ * separator that describes it.
+ */
+
+/* The fewest cells a leaf other than the root may hold: ceil(M/2). */
+static uint32_t leaf_node_min_cells(const Schema* schema){
+    return (leaf_node_max_cells(schema) + 1) / 2;
+}
+
+/* The fewest keys an internal node other than the root may hold: ceil(K/2) - 1. */
+static uint32_t internal_node_min_keys(void){
+    return (internal_node_max_keys() + 1) / 2 - 1;
+}
+
+/*
+ * Which child of `parent` the page `child_page_num` is: an index in
+ * [0, num_keys], num_keys meaning the right child. Found by page number rather
+ * than by key, so it can't be misled by separators that are mid-update. A page
+ * missing from its own parent can only mean a corrupt tree.
+ */
+static uint32_t child_index_in_parent(void* parent, uint32_t child_page_num){
+    uint32_t num_keys = *internal_node_num_keys(parent);
+    for(uint32_t i = 0; i <= num_keys; ++i){
+        if(*internal_node_child(parent, i) == child_page_num)
+            return i;
+    }
+    printf("Corrupt tree: page %u is not a child of its parent\n", child_page_num);
+    exit(EXIT_FAILURE);
+}
+
+/* Removes cell `cell_num` of a leaf, closing the gap and zeroing the slot it vacates. */
+static void leaf_node_remove_cell(void* node, uint32_t cell_num, const Schema* schema){
+    uint32_t num_cells = *leaf_node_num_cells(node);
+    uint32_t cell_size = leaf_node_cell_size(schema);
+    for(uint32_t i = cell_num; i + 1 < num_cells; ++i)
+        memcpy(leaf_node_cell(node, i, schema), leaf_node_cell(node, i + 1, schema), cell_size);
+    memset(leaf_node_cell(node, num_cells - 1, schema), 0, cell_size);
+    *leaf_node_num_cells(node) = num_cells - 1;
+}
+
+/* Opens a gap at cell `cell_num` of a leaf and copies `cell` into it. */
+static void leaf_node_insert_cell(void* node, uint32_t cell_num, const void* cell, const Schema* schema){
+    uint32_t num_cells = *leaf_node_num_cells(node);
+    uint32_t cell_size = leaf_node_cell_size(schema);
+    for(uint32_t i = num_cells; i > cell_num; --i)
+        memcpy(leaf_node_cell(node, i, schema), leaf_node_cell(node, i - 1, schema), cell_size);
+    memcpy(leaf_node_cell(node, cell_num, schema), cell, cell_size);
+    *leaf_node_num_cells(node) = num_cells + 1;
+}
+
+/*
+ * After the largest key of the subtree rooted at `page_num` has changed to
+ * `new_max`, updates the one separator that records it. That separator sits in
+ * the nearest ancestor where the subtree hangs off a child other than the
+ * rightmost; climbing while the node is its parent's rightmost child finds it.
+ * If the climb reaches the root the key was the whole tree's largest, which no
+ * separator records.
+ */
+static void lower_ancestor_separator(Pager* pager, uint32_t page_num, uint32_t new_max){
+    void* node = pager_get_page(pager, page_num);
+    while(!is_node_root(node)){
+        uint32_t parent_page_num = *node_parent(node);
+        void* parent = pager_get_page(pager, parent_page_num);
+        uint32_t index = child_index_in_parent(parent, page_num);
+        if(index < *internal_node_num_keys(parent)){
+            *internal_node_key(parent, index) = new_max;
+            return;
+        }
+        page_num = parent_page_num;
+        node = parent;
+    }
+}
+
+/*
+ * Takes child `child_index` out of an internal node after its contents have
+ * been merged into child `child_index - 1`, along with the separator between
+ * them. The merged node now spans both, so it inherits the separator that used
+ * to follow the removed child — the largest key of the pair — or, when the
+ * removed child was the rightmost, becomes the rightmost child itself. The
+ * vacated cell is zeroed.
+ */
+static void internal_node_remove_child(void* node, uint32_t child_index){
+    uint32_t num_keys = *internal_node_num_keys(node);
+    if(child_index == num_keys)
+        *internal_node_right_child(node) = *internal_node_child(node, num_keys - 1);
+    else{
+        *internal_node_key(node, child_index - 1) = *internal_node_key(node, child_index);
+        for(uint32_t i = child_index; i + 1 < num_keys; ++i)
+            memcpy(internal_node_cell(node, i), internal_node_cell(node, i + 1), INTERNAL_NODE_CELL_SIZE);
+    }
+    memset(internal_node_cell(node, num_keys - 1), 0, INTERNAL_NODE_CELL_SIZE);
+    *internal_node_num_keys(node) = num_keys - 1;
+}
+
+/*
+ * Replaces a root that has no keys left — one child — with that child. The
+ * root has to stay on its page, so the child's contents are copied up into it
+ * and the child's own page is freed; the copied children, if any, are pointed
+ * at the root page. A child that is a leaf is the only leaf in the tree, so
+ * the leaf chain needs no repair.
+ */
+static void collapse_root(Pager* pager, uint32_t root_page_num){
+    void* root = pager_get_page(pager, root_page_num);
+    uint32_t child_page_num = *internal_node_right_child(root);
+    void* child = pager_get_page(pager, child_page_num);
+
+    memcpy(root, child, PAGE_SIZE);
+    set_node_root(root, true);
+    *node_parent(root) = 0;
+    if(get_node_type(root) == NODE_INTERNAL)
+        reparent_children(pager, root, root_page_num);
+    pager_free_page(pager, child_page_num);
+}
+
+static void internal_node_rebalance(Pager* pager, uint32_t page_num);
+
+/*
+ * Called when an internal node has just lost a key to a merge below it. The
+ * root needs at least one key; left with none, it collapses onto its child.
+ * Any other node below its minimum is repaired from a sibling.
+ */
+static void after_child_removed(Pager* pager, uint32_t page_num){
+    void* node = pager_get_page(pager, page_num);
+    if(is_node_root(node)){
+        if(*internal_node_num_keys(node) == 0)
+            collapse_root(pager, page_num);
+        return;
+    }
+    if(*internal_node_num_keys(node) < internal_node_min_keys())
+        internal_node_rebalance(pager, page_num);
+}
+
+/*
+ * Merges leaf `right_page_num` into its left sibling `left_page_num`: its cells
+ * are appended, the left leaf takes over its place in the leaf chain, and its
+ * page is freed. The caller removes it from the parent.
+ */
+static void leaf_node_merge(Pager* pager, uint32_t left_page_num, uint32_t right_page_num, const Schema* schema){
+    void* left = pager_get_page(pager, left_page_num);
+    void* right = pager_get_page(pager, right_page_num);
+    uint32_t left_cells = *leaf_node_num_cells(left);
+    uint32_t right_cells = *leaf_node_num_cells(right);
+
+    memcpy(leaf_node_cell(left, left_cells, schema), leaf_node_cell(right, 0, schema),
+           right_cells * leaf_node_cell_size(schema));
+    *leaf_node_num_cells(left) = left_cells + right_cells;
+    *leaf_node_next_leaf(left) = *leaf_node_next_leaf(right);
+    pager_free_page(pager, right_page_num);
+}
+
+/*
+ * Repairs a leaf that has fallen one below its minimum. In order of
+ * preference:
+ *
+ *   - the left sibling can spare a cell: its last cell moves to our front, and
+ *     the separator between us drops to the left sibling's new largest key;
+ *   - the right sibling can spare one: its first cell moves to our end, and
+ *     our separator rises to that key, our new largest;
+ *   - neither can: merge with the left sibling, or with the right one if we're
+ *     the first child, and take the emptied leaf out of the parent.
+ *
+ * Borrowing changes nothing above the parent: the pair's combined keys, and so
+ * the separator above them, stay the same. A merge removes a key from the
+ * parent, which may then need repairing itself.
+ */
+static void leaf_node_rebalance(Pager* pager, uint32_t page_num, const Schema* schema){
+    void* node = pager_get_page(pager, page_num);
+    uint32_t parent_page_num = *node_parent(node);
+    void* parent = pager_get_page(pager, parent_page_num);
+    uint32_t index = child_index_in_parent(parent, page_num);
+    uint32_t parent_keys = *internal_node_num_keys(parent);
+    uint32_t min_cells = leaf_node_min_cells(schema);
+
+    if(index > 0){
+        uint32_t left_page_num = *internal_node_child(parent, index - 1);
+        void* left = pager_get_page(pager, left_page_num);
+        uint32_t left_cells = *leaf_node_num_cells(left);
+        if(left_cells > min_cells){
+            leaf_node_insert_cell(node, 0, leaf_node_cell(left, left_cells - 1, schema), schema);
+            leaf_node_remove_cell(left, left_cells - 1, schema);
+            *internal_node_key(parent, index - 1) = *leaf_node_key(left, left_cells - 2, schema);
+            return;
+        }
+    }
+    if(index < parent_keys){
+        uint32_t right_page_num = *internal_node_child(parent, index + 1);
+        void* right = pager_get_page(pager, right_page_num);
+        if(*leaf_node_num_cells(right) > min_cells){
+            uint32_t node_cells = *leaf_node_num_cells(node);
+            leaf_node_insert_cell(node, node_cells, leaf_node_cell(right, 0, schema), schema);
+            leaf_node_remove_cell(right, 0, schema);
+            *internal_node_key(parent, index) = *leaf_node_key(node, node_cells, schema);
+            return;
+        }
+    }
+
+    if(index > 0){
+        leaf_node_merge(pager, *internal_node_child(parent, index - 1), page_num, schema);
+        internal_node_remove_child(parent, index);
+    }
+    else{
+        leaf_node_merge(pager, page_num, *internal_node_child(parent, index + 1), schema);
+        internal_node_remove_child(parent, index + 1);
+    }
+    after_child_removed(pager, parent_page_num);
+}
+
+/*
+ * Merges internal node `right_page_num` into its left sibling `left_page_num`,
+ * given the parent's separator between them. The left node's rightmost child
+ * becomes an ordinary cell keyed by that separator — it was the largest key on
+ * the left — then the right node's cells follow and its rightmost child
+ * becomes the left node's. The moved children are pointed at their new
+ * parent, and the right node's page is freed. The caller removes it from the
+ * parent.
+ */
+static void internal_node_merge(Pager* pager, uint32_t left_page_num, uint32_t right_page_num, uint32_t separator){
+    void* left = pager_get_page(pager, left_page_num);
+    void* right = pager_get_page(pager, right_page_num);
+    uint32_t left_keys = *internal_node_num_keys(left);
+    uint32_t right_keys = *internal_node_num_keys(right);
+
+    *internal_node_cell(left, left_keys) = *internal_node_right_child(left);
+    *internal_node_key(left, left_keys) = separator;
+    memcpy(internal_node_cell(left, left_keys + 1), internal_node_cell(right, 0),
+           right_keys * INTERNAL_NODE_CELL_SIZE);
+    *internal_node_right_child(left) = *internal_node_right_child(right);
+    *internal_node_num_keys(left) = left_keys + 1 + right_keys;
+
+    for(uint32_t i = left_keys + 1; i <= left_keys + right_keys + 1; ++i){
+        void* child = pager_get_page(pager, *internal_node_child(left, i));
+        *node_parent(child) = left_page_num;
+    }
+    pager_free_page(pager, right_page_num);
+}
+
+/*
+ * Repairs an internal node that has fallen one below its minimum, like a leaf
+ * but moving children with their separators:
+ *
+ *   - the left sibling can spare a key: its rightmost child becomes our first
+ *     child, keyed by the parent's separator between us (that child's largest
+ *     key), and the separator drops to the left sibling's new largest;
+ *   - the right sibling can spare one: our rightmost child becomes a cell keyed
+ *     by our separator, the right sibling's first child becomes our rightmost,
+ *     and our separator rises to that child's key;
+ *   - neither can: merge with a sibling, pulling the separator between us down.
+ *
+ * A child that moves is pointed at its new parent. A merge removes a key from
+ * the parent, so the repair may continue one level up.
+ */
+static void internal_node_rebalance(Pager* pager, uint32_t page_num){
+    void* node = pager_get_page(pager, page_num);
+    uint32_t parent_page_num = *node_parent(node);
+    void* parent = pager_get_page(pager, parent_page_num);
+    uint32_t index = child_index_in_parent(parent, page_num);
+    uint32_t parent_keys = *internal_node_num_keys(parent);
+    uint32_t node_keys = *internal_node_num_keys(node);
+    uint32_t min_keys = internal_node_min_keys();
+
+    if(index > 0){
+        uint32_t left_page_num = *internal_node_child(parent, index - 1);
+        void* left = pager_get_page(pager, left_page_num);
+        uint32_t left_keys = *internal_node_num_keys(left);
+        if(left_keys > min_keys){
+            uint32_t moved_child = *internal_node_right_child(left);
+            for(uint32_t i = node_keys; i > 0; --i)
+                memcpy(internal_node_cell(node, i), internal_node_cell(node, i - 1), INTERNAL_NODE_CELL_SIZE);
+            *internal_node_cell(node, 0) = moved_child;
+            *internal_node_key(node, 0) = *internal_node_key(parent, index - 1);
+            *internal_node_num_keys(node) = node_keys + 1;
+
+            *internal_node_right_child(left) = *internal_node_child(left, left_keys - 1);
+            *internal_node_key(parent, index - 1) = *internal_node_key(left, left_keys - 1);
+            memset(internal_node_cell(left, left_keys - 1), 0, INTERNAL_NODE_CELL_SIZE);
+            *internal_node_num_keys(left) = left_keys - 1;
+
+            *node_parent(pager_get_page(pager, moved_child)) = page_num;
+            return;
+        }
+    }
+    if(index < parent_keys){
+        uint32_t right_page_num = *internal_node_child(parent, index + 1);
+        void* right = pager_get_page(pager, right_page_num);
+        uint32_t right_keys = *internal_node_num_keys(right);
+        if(right_keys > min_keys){
+            uint32_t moved_child = *internal_node_child(right, 0);
+            *internal_node_cell(node, node_keys) = *internal_node_right_child(node);
+            *internal_node_key(node, node_keys) = *internal_node_key(parent, index);
+            *internal_node_num_keys(node) = node_keys + 1;
+            *internal_node_right_child(node) = moved_child;
+
+            *internal_node_key(parent, index) = *internal_node_key(right, 0);
+            for(uint32_t i = 0; i + 1 < right_keys; ++i)
+                memcpy(internal_node_cell(right, i), internal_node_cell(right, i + 1), INTERNAL_NODE_CELL_SIZE);
+            memset(internal_node_cell(right, right_keys - 1), 0, INTERNAL_NODE_CELL_SIZE);
+            *internal_node_num_keys(right) = right_keys - 1;
+
+            *node_parent(pager_get_page(pager, moved_child)) = page_num;
+            return;
+        }
+    }
+
+    if(index > 0){
+        internal_node_merge(pager, *internal_node_child(parent, index - 1), page_num,
+                            *internal_node_key(parent, index - 1));
+        internal_node_remove_child(parent, index);
+    }
+    else{
+        internal_node_merge(pager, page_num, *internal_node_child(parent, index + 1),
+                            *internal_node_key(parent, index));
+        internal_node_remove_child(parent, index + 1);
+    }
+    after_child_removed(pager, parent_page_num);
+}
+
+/*
+ * Deletes cell `cell_num` from the leaf on `page_num`.
+ *
+ * The cell is removed and its slot zeroed. A root leaf needs nothing more: it
+ * may hold any number of cells, none included. Any other leaf held at least
+ * its minimum — two or more, since every leaf fits at least three — so it
+ * still has a cell. If the removed key was the leaf's largest, the separator
+ * that recorded it is lowered to the new largest first, while the parent
+ * pointers still describe the tree as it was; then a leaf that has dropped
+ * below its minimum is repaired, which may cascade to the root.
+ */
+void leaf_node_delete(Pager* pager, uint32_t page_num, uint32_t cell_num, const Schema* schema){
+    void* node = pager_get_page(pager, page_num);
+    uint32_t num_cells = *leaf_node_num_cells(node);
+    bool removed_largest = cell_num == num_cells - 1;
+
+    leaf_node_remove_cell(node, cell_num, schema);
+    if(is_node_root(node))
+        return;
+
+    if(removed_largest)
+        lower_ancestor_separator(pager, page_num, *leaf_node_key(node, num_cells - 2, schema));
+    if(*leaf_node_num_cells(node) < leaf_node_min_cells(schema))
+        leaf_node_rebalance(pager, page_num, schema);
 }
 
 /*

@@ -15,15 +15,17 @@
 typedef enum{
     STATEMENT_INSERT,
     STATEMENT_SELECT,
-    STATEMENT_CREATE_TABLE
+    STATEMENT_CREATE_TABLE,
+    STATEMENT_DELETE
 }StatementType;
 
 /*
- * A prepared statement: its kind, the table it acts on (INSERT and SELECT),
- * the row to insert (INSERT), the checked definition of a new table (CREATE
- * TABLE), and for a SELECT the columns to print, the bound WHERE, the plan
- * for reading the table and whether it's only to be explained. Fields a kind
- * doesn't use stay zeroed, so statement_free is always safe.
+ * A prepared statement: its kind, the table it acts on (INSERT, SELECT and
+ * DELETE), the row to insert (INSERT), the checked definition of a new table
+ * (CREATE TABLE), the columns to print (SELECT), and for a SELECT or DELETE
+ * the bound WHERE, the plan for reading the table and whether it's only to be
+ * explained. Fields a kind doesn't use stay zeroed, so statement_free is
+ * always safe.
  */
 typedef struct{
     StatementType type;
@@ -32,9 +34,9 @@ typedef struct{
     TableDefinition definition;   /* owned until the table is created */
     uint32_t* column_ids;         /* SELECT: heap-owned, the columns to print in order */
     uint32_t num_columns;
-    BoundExpr* where;             /* SELECT: heap-owned; NULL without a WHERE */
-    Plan plan;                    /* SELECT: how the table will be read */
-    bool explain;                 /* SELECT: print the plan instead of running it */
+    BoundExpr* where;             /* SELECT, DELETE: heap-owned; NULL without a WHERE */
+    Plan plan;                    /* SELECT, DELETE: how the table will be read */
+    bool explain;                 /* SELECT, DELETE: print the plan instead of running it */
 }Statement;
 
 /* Outcome of turning a line of SQL into a Statement. */
@@ -55,8 +57,8 @@ PrepareResult prepare_statement(Database* db, const char* sql, Statement* statem
 
 /*
  * Frees whatever a statement still owns: the row built for an insert, a table
- * definition that was never executed, and a select's column list and WHERE.
- * Safe on any prepared statement.
+ * definition that was never executed, a select's column list, and the WHERE of
+ * a select or delete. Safe on any prepared statement.
  */
 void statement_free(Statement* statement);
 

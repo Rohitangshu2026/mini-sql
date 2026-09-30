@@ -8,6 +8,7 @@
 #define HEADER_VERSION_OFFSET      16u
 #define HEADER_PAGE_SIZE_OFFSET    20u
 #define HEADER_CATALOG_ROOT_OFFSET 24u
+#define HEADER_FREE_HEAD_OFFSET    28u
 
 /* Exactly 16 bytes: fifteen characters and the terminating NUL. */
 static const char HEADER_MAGIC[HEADER_MAGIC_SIZE] = "mini-sql format";
@@ -51,7 +52,9 @@ void file_header_initialize(void* page, uint32_t catalog_root_page_num){
  *     would misplace every cell;
  *   - the catalog root page: it must be a page of the file, and not page 0,
  *     which is this header. A root anywhere else would send the first lookup
- *     into garbage or past the end of the file.
+ *     into garbage or past the end of the file;
+ *   - the free-list head: 0 for an empty list, otherwise a page of the file
+ *     other than the header, or the next allocation would read past the end.
  */
 bool file_header_validate(const void* page, uint32_t num_pages, const char* filename,
                           char* message, size_t message_size){
@@ -84,10 +87,28 @@ bool file_header_validate(const void* page, uint32_t num_pages, const char* file
         return false;
     }
 
+    uint32_t free_head = read_field(page, HEADER_FREE_HEAD_OFFSET);
+    if(free_head >= num_pages){
+        snprintf(message, message_size,
+                 "Error: %s is corrupt: its free-list head %u is not a page of the file.",
+                 filename, free_head);
+        return false;
+    }
+
     return true;
 }
 
 /* The catalog's root page, as the header records it. */
 uint32_t file_header_catalog_root_page(const void* page){
     return read_field(page, HEADER_CATALOG_ROOT_OFFSET);
+}
+
+/* The free list's first page, as the header records it; 0 means empty. */
+uint32_t file_header_free_head(const void* page){
+    return read_field(page, HEADER_FREE_HEAD_OFFSET);
+}
+
+/* Writes the free list's first page into the header. */
+void file_header_set_free_head(void* page, uint32_t free_head){
+    write_field(page, HEADER_FREE_HEAD_OFFSET, free_head);
 }

@@ -39,6 +39,12 @@ Table* table_create(Pager* pager, uint32_t root_page_num, TableDefinition* defin
  */
 bool table_insert(Table* table, const Record* record);
 
+/*
+ * Deletes the row whose key is `key`, keeping the tree balanced. Returns false,
+ * changing nothing, if there is no such row.
+ */
+bool table_delete(Table* table, uint32_t key);
+
 /* Frees the table and everything it owns; the pager is left alone. */
 void table_free(Table* table);
 

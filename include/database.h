@@ -21,7 +21,7 @@ typedef struct{
     uint32_t num_tables;
     uint32_t capacity;        /* slots in `tables` */
     uint32_t next_table_id;   /* catalog id for the next table created */
-    uint64_t last_rows_examined;   /* rows the last SELECT read from leaves, for .stats */
+    uint64_t last_rows_examined;   /* rows the last SELECT or DELETE read, for .stats */
 }Database;
 
 /*

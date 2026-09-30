@@ -85,6 +85,15 @@ void leaf_node_insert(Pager* pager, uint32_t page_num, uint32_t cell_num, uint32
                       const Record* value, const Schema* schema);
 
 /*
+ * Deletes cell `cell_num` from the leaf on page `page_num`, then keeps the tree
+ * balanced: a leaf or internal node that falls below its minimum fill borrows
+ * from a sibling or merges with it, merges can cascade up to the root, and a
+ * root left with one child is replaced by it. Every separator stays equal to
+ * the largest key on its left, and emptied pages go on the free list.
+ */
+void leaf_node_delete(Pager* pager, uint32_t page_num, uint32_t cell_num, const Schema* schema);
+
+/*
  * Internal nodes. The header holds the key count and the rightmost child; the
  * body is an array of (child page, key) cells. A node with N keys therefore has
  * N + 1 children, the last of which lives in the header rather than a cell.

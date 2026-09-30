@@ -88,6 +88,10 @@ set(MINI_SQL_TESTS
     where_filters
     where_errors
     explain_and_ranges
+    delete_basic
+    delete_rebalance
+    delete_random
+    delete_pages
 )
 foreach(t ${MINI_SQL_TESTS})
     add_test(
