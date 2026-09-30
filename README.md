@@ -130,6 +130,28 @@ db > SELECT * FROM users WHERE id = 'ten';
 Type error: cannot compare INT column 'id' with 'ten'.
 ```
 
+`DELETE` takes the same `WHERE` and picks its rows the same way. The tree stays
+balanced as rows go, and the pages it no longer needs are kept for reuse:
+
+```text
+db > EXPLAIN DELETE FROM users WHERE id > 10;
+SEARCH users USING PRIMARY KEY (id >= 11)
+Executed. (0.001 ms)
+db > DELETE FROM users WHERE id > 10;
+Executed. (0.545 ms)
+db > .stats
+Rows examined: 990
+db > DELETE FROM users WHERE username = 'user3';
+Executed. (0.001 ms)
+db > SELECT id FROM users;
+(1)
+(2)
+(4)
+…
+(10)
+Executed. (0.002 ms)
+```
+
 `.tables` lists the tables and `.schema [TABLE]` prints their definitions;
 `.btree TABLE` prints a table's tree and `.constants [TABLE]` the on-page layout
 sizes. The trailing `;` is optional, keywords and names ignore case, and `--`
@@ -168,8 +190,11 @@ tests. No third-party libraries.
 | **Page cache that grows with the file** — no page limit | ✅ |
 | **Versioned file header**: foreign, older or corrupt files are refused, never misread | ✅ |
 | Per-statement execution timing | ✅ |
-| Black-box test suite (30 CTest cases) with a B+ tree invariant checker | ✅ |
-| `DELETE`, `UPDATE` | ⛔ |
+| **`DELETE FROM t [WHERE …]`**, planned like `SELECT` | ✅ |
+| **Rebalancing on delete**: borrow, merge, cascade, root collapse — nodes stay half full | ✅ |
+| **Free list**: pages emptied by deletes are reused before the file grows | ✅ |
+| Black-box test suite (34 CTest cases) with a B+ tree invariant checker | ✅ |
+| `UPDATE` | ⛔ |
 | `ORDER BY`, `LIMIT`, aggregates, secondary indexes | ⛔ |
 | `DROP TABLE`, `ALTER TABLE` | ⛔ |
 | Crash safety (journal / WAL) | ⛔ flush happens only on clean `.exit` |
@@ -393,11 +418,11 @@ doesn't include `cursor.h` — so it compiles in any order.
 | `parser` | Recursive descent from tokens to a syntax tree; syntax errors | `parse_statement`, `ast_free` |
 | `schema` | Runtime column layout: types, sizes, **computed offsets**; case-insensitive name lookup | `schema_create`, `schema_find_column_by_id/name`, `schema_names_equal`, `schema_free` |
 | `record` | An opaque row payload + schema-keyed get/set + (de)serialize; prints all or chosen columns | `record_init`, `record_set_int/text`, `serialize_record`, `print_record`, `print_record_columns` |
-| `pager` | Growable page cache backed by a file; allocates zeroed pages, reads on miss, flushes on close | `pager_open`, `pager_get_page`, `get_unused_page_num`, `pager_flush`, `pager_close` |
+| `pager` | Growable page cache backed by a file; allocates zeroed pages from the free list or the end of the file, frees them back, reads on miss, flushes on close | `pager_open`, `pager_get_page`, `pager_allocate_page`, `pager_free_page`, `pager_flush`, `pager_close` |
 | `file_header` | Page 0's layout: writes a new header, validates an existing one, reads the catalog root | `file_header_initialize`, `file_header_validate`, `file_header_catalog_root_page` |
-| `btree` | Leaf and internal node formats, per-node binary search, splits, tree printer, row-size limit | `leaf_node_insert`, `leaf_node_find_cell`, `internal_node_find_child`, `leaf_node_max_row_size`, `print_tree` |
+| `btree` | Leaf and internal node formats, per-node binary search, splits, deletes with rebalancing, tree printer, row-size limit | `leaf_node_insert`, `leaf_node_delete`, `leaf_node_find_cell`, `internal_node_find_child`, `leaf_node_max_row_size`, `print_tree` |
 | `table_definition` | Checks a parsed `CREATE TABLE` and builds its schema, key column and canonical SQL | `table_definition_from_ast`, `table_definition_free` |
-| `table` | One table: its B-tree root, schema, key column and definition; inserts a row by key | `table_create`, `table_insert`, `table_free` |
+| `table` | One table: its B-tree root, schema, key column and definition; inserts and deletes a row by key | `table_create`, `table_insert`, `table_delete`, `table_free` |
 | `catalog` | The table of tables: its own definition in SQL, adding and reading entries | `catalog_open`, `catalog_add`, `catalog_load` |
 | `database` | Opens a file (new, or checked and loaded from its catalog), creates and finds tables, remembers rows read for `.stats`, closes | `db_open`, `db_close`, `database_find_table`, `database_create_table` |
 | `cursor` | A position in a leaf; tree descent and leaf-chain traversal | `table_start`, `table_find`, `cursor_key`, `cursor_value`, `cursor_advance` |
@@ -546,10 +571,25 @@ page 2…  table roots and every other node, each allocated at the end of the fi
 | Bytes | Field |
 | --- | --- |
 | 0–15 | magic `mini-sql format\0`, after SQLite's `SQLite format 3\0` |
-| 16–19 | file format version — `2` |
+| 16–19 | file format version — `3` |
 | 20–23 | page size — `4096` |
 | 24–27 | page holding the catalog's root node |
-| 28–4095 | zero, reserved for fields later formats add |
+| 28–31 | first page of the free list — `0` when it's empty |
+| 32–4095 | zero, reserved for fields later formats add |
+
+### Free pages
+
+A page a delete empties — a merged leaf or internal node, or the child a collapsing
+root absorbs — goes on the **free list**, a chain through the free pages themselves
+that starts at the header's bytes 28–31. A free page is zeroed, then marked:
+
+| Bytes | Field |
+| --- | --- |
+| 0 | `0xFF` — never a node type (0 internal, 1 leaf), so a stray pointer into a free page reads as a corrupt node instead of data |
+| 4–7 | next page on the free list, `0` at the end |
+
+Every new node takes its page from the free list first and only grows the file
+when the list is empty. The file never shrinks; freed pages wait for reuse.
 
 ### The catalog
 
@@ -575,9 +615,10 @@ message — a file that fails:
 | --- | --- |
 | length a whole number of pages | `Db file is not a whole number of pages. Corrupt file.` |
 | the magic | `Error: X is not a mini-sql database, or was written by an older build.` |
-| the format version | `Error: X uses file format 1; this build reads format 2.` |
+| the format version | `Error: X uses file format 2; this build reads format 3.` |
 | the page size | `Error: X uses 8192-byte pages; this build uses 4096.` |
 | the catalog root is a node page | `Error: X is corrupt: its catalog root page 99 is not a node page of the file.` |
+| the free-list head is a page of the file | `Error: X is corrupt: its free-list head 99 is not a page of the file.` |
 | each stored definition parses | `Error: X is corrupt: the stored definition of table users doesn't parse.` |
 | …and passes the `CREATE TABLE` checks | `Error: X is corrupt: the stored definition of table users is invalid.` |
 | …and is for the table the catalog names | `Error: X is corrupt: the catalog lists table xsers, but its definition is for users.` |
@@ -585,8 +626,8 @@ message — a file that fails:
 
 Every file written before the header existed has a node where the magic belongs, so
 it's refused by the magic check rather than misread. Any change to what a file
-holds bumps the format version — the catalog made this format 2 — so older files
-are always refused cleanly.
+holds bumps the format version — the catalog made format 2, the free list format 3
+— so older files are always refused cleanly.
 
 The header gets a whole page to itself. SQLite instead fits a 100-byte header at the
 start of its first page, which also holds a B-tree root; here every node starts at
@@ -842,6 +883,48 @@ The trees match the tutorial's: the test build reproduces its published seven-le
 three-level tree line for line. The route there differs; see
 [the divergences](#where-mini-sql-diverges-from-the-tutorial).
 
+### Delete — and rebalancing
+
+Deleting keeps the tree balanced, so a lookup stays one descent of logarithmic
+depth however rows come and go. Every node but the root stays **at least half
+full** — ⌈M/2⌉ cells in a leaf of capacity M (7 for `users`), ⌈K/2⌉−1 keys in an
+internal node with room for K (254 at the real 510) — which is exactly what a split
+leaves behind, so a tree only ever inserted into already meets it.
+
+```mermaid
+flowchart TD
+    A["remove the cell, zero its slot"] --> B{"was it the leaf's largest key?"}
+    B -->|yes| C["lower the one separator that recorded it"]
+    B -->|no| D{"below minimum, and not the root?"}
+    C --> D
+    D -->|no| Z["done"]
+    D -->|yes| E{"can a sibling spare an entry?"}
+    E -->|"left, then right"| F["borrow it, fix the separator between us"]
+    F --> Z
+    E -->|neither| G["merge with a sibling, free the emptied page"]
+    G --> H["the parent loses a separator and a child"]
+    H --> I{"parent is the root?"}
+    I -->|"yes, 0 keys left"| J["collapse: the only child's contents move up into the root page"]
+    I -->|"no, below minimum"| E
+    I -->|otherwise| Z
+```
+
+- **Separators stay exact.** When a leaf loses its largest key, the one separator
+  that recorded it — in the nearest ancestor where the leaf's subtree isn't the
+  rightmost child — drops to the new largest. Every borrow and merge sets the
+  separators it touches from actual keys. Range scans and lookups start from a
+  single descent that relies on this.
+- **Borrowing** moves one entry across: a leaf takes its sibling's nearest cell; an
+  internal node takes its sibling's nearest child, together with the separator from
+  the parent, and hands the parent a new one.
+- **Merging** fits because a node one short plus a sibling at the minimum is never
+  more than a full node. An internal merge pulls the parent's separator down between
+  the two halves. A merged leaf's place in the leaf chain passes to its sibling.
+- **The root never moves**, even when it shrinks: a root left with one child takes
+  that child's contents onto its own page, and the child's page is freed.
+- **Pages go on the free list**, and children that move are pointed at their new
+  parent.
+
 ### Scan — walking the leaf chain
 
 `table_start` is simply `table_find(table, 0)`: keys are unsigned, so searching
@@ -969,6 +1052,36 @@ sequenceDiagram
     E-->>M: EXECUTE_SUCCESS — .stats will say 10
 ```
 
+### DELETE
+
+A `DELETE` is bound and planned exactly like a `SELECT` with the same `WHERE`, and
+then runs in two phases: first the rows are chosen and only their keys kept, then
+each key is deleted. Deleting reshapes the tree — cells shift, nodes merge, pages
+are freed, the root can collapse — so no cursor is walking it while that happens.
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant E as executor
+    participant C as cursor
+    participant T as table
+    participant B as btree
+    participant P as pager
+
+    U->>E: DELETE FROM users WHERE id > 10
+    Note over E: plan RANGE from 11 to the last key
+    E->>C: table_find(users, 11), then walk the leaf chain
+    C-->>E: keys 11 … 1000, each checked against the WHERE
+    Note over E: phase 1 over — the keys are collected
+    loop each collected key
+        E->>T: table_delete(users, key)
+        T->>B: leaf_node_delete(page, cell)
+        B->>B: fix separators, borrow or merge, maybe collapse the root
+        B->>P: pager_free_page(emptied page)
+    end
+    E-->>U: Executed. — .stats says 990
+```
+
 On `.exit`, `db_close` flushes every cached page to the file — that's when the data
 becomes durable.
 
@@ -1037,11 +1150,12 @@ support, so later stages only add grammar:
 **Grammar**, one parser function per rule:
 
 ```text
-statement  := [ EXPLAIN ] ( insert | select | create ) [ ';' ] END   (EXPLAIN only before select)
+statement  := [ EXPLAIN ] ( insert | select | create | delete ) [ ';' ] END   (EXPLAIN only before select or delete)
 insert     := INSERT INTO name [ '(' name { ',' name } ')' ] VALUES '(' literal { ',' literal } ')'
 select     := SELECT ( '*' | name { ',' name } ) FROM name [ WHERE expr ]
 create     := CREATE TABLE name '(' column_def { ',' column_def } ')'
 column_def := name ( INT | TEXT '(' INTEGER ')' ) [ PRIMARY KEY ]
+delete     := DELETE FROM name [ WHERE expr ]
 expr       := and_expr { OR and_expr }
 and_expr   := not_expr { AND not_expr }
 not_expr   := NOT not_expr | primary
@@ -1118,7 +1232,8 @@ Every message carries its category:
 | `… WHERE id = username` | `Type error: cannot compare INT column 'id' with TEXT column 'username'.` |
 | `… WHERE id = 99999999999999999999` | `Type error: 99999999999999999999 is out of range for comparison with INT column 'id'.` |
 | `… WHERE id 5` | `Syntax error: expected a comparison operator near '5' at column 30.` |
-| `EXPLAIN INSERT …` | `Syntax error: expected SELECT near 'INSERT' at column 9.` |
+| `EXPLAIN INSERT …` | `Syntax error: expected SELECT or DELETE near 'INSERT' at column 9.` |
+| `DELETE users` | `Syntax error: expected FROM near 'users' at column 8.` |
 
 ---
 
@@ -1148,6 +1263,8 @@ A range starts where one descent for `low` lands: the first key at or above it. 
 rests on the separator invariant — each separator equals the largest key on its left
 — which `btree_check` enforces and deletion will have to keep. The walk then follows
 `next_leaf` and stops at the first key past `high` without decoding it.
+
+A `DELETE` is planned the same way, and its `EXPLAIN` prints the same plans.
 
 **The whole `WHERE` is still checked against every row read.** The range only decides
 which rows are read, so `id > 990 AND username != 'x'` reads keys 991 onwards and
@@ -1211,10 +1328,13 @@ Lifecycle rules:
 - A `TableDefinition` belongs to its `Statement` until `database_create_table`
   hands its name, schema and text to the new `Table`; `statement_free` then frees
   nothing twice, and frees everything if the table was never created.
-- New nodes get their page from `get_unused_page_num` — the page just past the end
-  of the file — and are cached like any other page, zero-filled. Nothing is
-  reserved until the page is fetched, so callers fetch a page before allocating the
-  next one; a fetch further past the end is refused as a bug.
+- New nodes get their page from `pager_allocate_page`, which returns it resident and
+  zero-filled: the head of the free list if there is one, otherwise the page just
+  past the end of the file. A fetch further past the end is refused as a bug.
+- A page a delete empties goes back through `pager_free_page`, which zeroes it,
+  marks it free and pushes it onto the free list. Each page is freed only by the
+  merge or collapse that emptied it, and the list's head is written into the header
+  on close.
 - The page cache is an array of page pointers that doubles as the file grows. Only
   the array moves: each page is its own allocation, so a node pointer the B-tree
   holds stays valid while it fetches other pages.
@@ -1306,7 +1426,7 @@ the `users` table, created by a separate run of the binary so its output never
 mixes with the test's — except the `CREATE TABLE` cases that need an empty
 database.
 
-The 30 cases:
+The 34 cases:
 
 | Area | Cases |
 | --- | --- |
@@ -1330,6 +1450,10 @@ The 30 cases:
 | Column lists | chosen columns in any order and with repeats, on a table keyed by its second column; names ignoring case; unknown columns |
 | `WHERE` results | 24 conditions on a 60-row table with negative values, each compared with the same condition evaluated independently by `awk`: every operator on INT and TEXT, precedence, parentheses, column against column, constant conditions, a literal wider than its column, case-sensitive text, and key ranges alongside other conditions |
 | `WHERE` errors | every name, type and syntax error, `EXPLAIN` before anything but `SELECT`, and the nesting limit — 64 levels of `NOT` or parentheses accepted, the 65th refused at its column |
+| Deleting | by key (reading one row), a missing key (reading none), a key range, other columns, and everything at once down to one empty root leaf; `EXPLAIN DELETE`; every error; the result surviving a reopen |
+| Rebalancing | a four-level tree of 306 rows deleted to empty in ascending, descending and scrambled order, checked after every 30 deletes — balanced, half full, separators exact, exactly the remaining rows — with range queries midway |
+| Random operations | 1,500 inserts and deletes from a fixed generator, compared every 150 operations with a model of the keys that should exist, duplicates included, and after a reopen |
+| Page reuse | deleting 300 rows leaves the file its size with a free list whose head is marked free; reinserting them in the next session reuses those pages instead of growing the file |
 | Plans and ranges | `EXPLAIN` for 21 conditions (merged, clamped, reversed, contradictory, and the ones that must scan); rows read for lookups, misses, ranges and scans on 1,000 rows; and 91 ranges over a four-level tree of scrambled even ids, many starting or ending exactly on its separators, each returning and reading exactly the ids inside it |
 
 How the suite earns its trust:
@@ -1340,8 +1464,9 @@ How the suite earns its trust:
 - **An invariant checker for trees too big to spell out.** `btree_check` reads a
   printed tree and fails on the first broken B+ tree rule: keys not strictly
   increasing, a separator that isn't the largest key on its left, a node whose size
-  disagrees with its contents or whose children and keys don't alternate, an empty
-  or overfull node, or leaves at different depths. It was itself tested against
+  disagrees with its contents or whose children and keys don't alternate, a node
+  over capacity or — other than the root — below half full, or leaves at different
+  depths. It was itself tested against
   doctored trees breaking each rule. It catches damage a scan can't see: a
   misfiled subtree still returns every row through the leaf chain.
 - **Insertion orders chosen to hit each branch.** The split tests insert the same
@@ -1388,11 +1513,17 @@ How the suite earns its trust:
   to create, some with mangled names, all loaded back from their stored definitions
   when the file was reopened. A third mixed in `WHERE` and `EXPLAIN` fragments and
   expressions nested 50 to 200 deep: 911 were refused at the nesting limit, and
-  nothing reached a sanitizer.
+  nothing reached a sanitizer. A fourth interleaved `DELETE`s with inserts: 15,117
+  of its 20,000 lines ran, nothing reached a sanitizer, the reopened tree passed the
+  checker, and `leaks` found nothing across sessions of deletes.
 - **Query mutation checks.** Letting `OR` bind tighter than `AND`, planning `<` as
   `<=`, a range that ignores its high end, skipping the per-row `WHERE` inside a
   range, comparing text without regard to case, and removing the nesting limit
   each fail a test.
+- **Delete mutation checks.** Turning off borrowing, skipping the separator fix
+  when a leaf loses its largest key, never collapsing the root, not splicing the
+  leaf chain around a merge, not re-pointing children after an internal merge, never
+  reusing freed pages, and rebalancing only leaves each fail a test.
 - **Timeouts.** Scans follow on-disk pointers, so each test has a 10-second limit
   that turns a pointer cycle into a fast failure instead of a hang.
 
@@ -1483,6 +1614,17 @@ are read; the whole `WHERE` is evaluated on every one of them. Correctness never
 depends on the planner understanding a condition — a condition it can't use just
 means more rows are read — so the planner can stay small and still be safe.
 
+**Collect, then change.** A `DELETE` finishes choosing its rows — keeping only their
+keys — before it removes any of them. Rebalancing moves cells, merges nodes, frees
+pages and can replace the root, so a cursor that walked the tree while it changed
+could skip rows or read a freed page. Separating the two phases rules that class of
+bug out rather than guarding against it.
+
+**Always at least half full.** Deletion repairs a node the moment it drops below
+its minimum, by borrowing or merging, so no sequence of deletes can leave long
+chains of nearly empty nodes. That is what keeps a lookup O(log n) in the number of
+rows the table holds now, not the most it ever held.
+
 **Flat chains, bounded nesting.** `AND` and `OR` hold a list of operands, so a
 condition with a thousand terms is one level deep, and only `NOT` and parentheses
 add depth — at most 64 levels. Parsing, binding, evaluating and freeing an
@@ -1546,11 +1688,9 @@ flowchart LR
 
     classDef done fill:#d6f5d6,stroke:#3a9a3a;
     classDef now fill:#fff2cc,stroke:#bba12a;
-    classDef todo fill:#eeeeee,stroke:#999999;
 
-    class A,S1,S2,S3,S4 done;
-    class S5 now;
-    class S6 todo;
+    class A,S1,S2,S3,S4,S5 done;
+    class S6 now;
 ```
 
 - **Done — the tutorial (1–14):** REPL, schema-driven rows, a file-backed pager, the
@@ -1573,12 +1713,12 @@ flowchart LR
   on a table's primary key become a point lookup or a descent plus a bounded walk
   along the leaf chain, the whole `WHERE` is checked on every row read, `EXPLAIN`
   shows the plan and `.stats` the rows it read.
-- **Next — Stage 5, `DELETE`:** `DELETE FROM t [WHERE …]` bound and planned by the
-  same code, then borrowing from and merging with siblings, collapsing the root,
-  and reusing freed pages, so the tree stays balanced — and the separator invariant
-  that range scans rely on keeps holding.
-- **Stage 6 — error audit and presentation:** every storage failure reports an error
-  instead of ending the process, plus a benchmark of lookups against scans.
+- **Done — Stage 5, `DELETE`:** `DELETE FROM t [WHERE …]` bound and planned by the
+  same code; deletion that borrows from and merges with siblings, cascades up and
+  collapses the root, so every node stays half full and every separator exact; and
+  a free list that reuses emptied pages (file format 3).
+- **Next — Stage 6, error audit and presentation:** every storage failure reports
+  an error instead of ending the process, plus a benchmark of lookups against scans.
 - **Later, perhaps:** dropping on-disk parent pointers for a path kept by the cursor,
   as SQLite does, which would save a split from fetching every child it moves.
 
@@ -1645,11 +1785,14 @@ This is a learning engine. Known gaps, most of them on the [roadmap](#roadmap):
   bits), though memory runs out well before that.
 - **Crash safety** — pages are flushed only on a clean `.exit`; kill the process, or
   hit a fatal error, and unsaved changes are lost. No rollback journal or WAL.
-- **Older files** — files from before the header existed, and format-1 files from
-  before the catalog, are refused with a message; delete and recreate them.
+- **Older files** — files from before the header existed, format-1 files from
+  before the catalog and format-2 files from before the free list are refused with
+  a message; delete and recreate them.
+- **The file never shrinks** — pages freed by deletes are reused, but not returned
+  to the operating system; there is no `VACUUM`.
 - **A small SQL dialect** — `CREATE TABLE`, `INSERT`, and `SELECT` with a column
-  list and a `WHERE` of comparisons, one statement per line; INT and TEXT(n)
-  columns only, no NULLs or defaults. `DELETE` is on the roadmap; `UPDATE`,
+  list and a `WHERE` of comparisons, and `DELETE` with the same `WHERE`, one
+  statement per line; INT and TEXT(n) columns only, no NULLs or defaults. `UPDATE`,
   `DROP TABLE`, `ALTER TABLE`, `ORDER BY`, `LIMIT`, aggregates, `LIKE`, arithmetic,
   joins and subqueries are not. The keywords are reserved, so a table or column
   can't be named `key` or `text`.
